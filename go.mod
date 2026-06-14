@@ -6,7 +6,7 @@ require (
 	github.com/actions/scaleset v0.4.0
 	github.com/lxc/incus/v6 v6.23.0
 	github.com/prometheus/client_golang v1.23.2
-	golang.org/x/sync v0.20.0
+	golang.org/x/sync v0.21.0
 	gopkg.in/yaml.v2 v2.4.0
 )
 
