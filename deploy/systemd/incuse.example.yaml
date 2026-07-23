@@ -36,12 +36,7 @@ scale_sets:
   # created group every org has.
   runner_group: Default
 
-  # Shared labels. The generated scale-set name is always added.
-  base_labels:
-    - self-hosted
-    - linux
-
-  # Use the generated name in runs-on, for example:
+  # Use one generated class name as the runs-on target, for example:
   # runs-on: incuse-4vcpu-8gb-20gb-amd64
   classes:
     - vcpus: 2

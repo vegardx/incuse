@@ -64,7 +64,9 @@ Setting `runner.privileged: true` (only valid alongside `instance_type: containe
 
 ### Running both shapes on the same host
 
-incuse is single-scale-set per process. To offer both VM and container runners on the same host, run two systemd units pointing at two configs:
+One incuse process can manage multiple resource classes, but it has one
+instance type. To offer both VM and container runners on the same host, run
+two systemd units with distinct scale-set prefixes:
 
 ```
 /etc/systemd/system/incuse-vm.service        → /etc/incuse/vm.yaml
@@ -75,10 +77,10 @@ Workflows pick by label:
 
 ```yaml
 # fast, no docker
-runs-on: [self-hosted, incuse-rocket-container]
+runs-on: incuse-container-2vcpu-4gb-20gb-amd64
 
 # docker-needing
-runs-on: [self-hosted, incuse-rocket-vm]
+runs-on: incuse-vm-4vcpu-8gb-20gb-amd64
 ```
 
 ## Incus profile (`incuse-runner`)
