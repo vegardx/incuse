@@ -22,6 +22,15 @@ jobs:
           go-version: "1.25.x"
           cache: true
 
+      - name: Test
+        run: make test
+
+      - name: Vet
+        run: make vet
+
+      - name: Shellcheck
+        run: shellcheck deploy/systemd/install.sh scripts/*.sh
+
       - uses: goreleaser/goreleaser-action@v7
         with:
           version: "~> v2"
