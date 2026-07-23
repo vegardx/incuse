@@ -33,7 +33,7 @@ type fakeIncus struct {
 	launchEntered chan struct{} // optional: closed by Launch before it blocks
 }
 
-func (f *fakeIncus) Launch(_ context.Context, req incus.LaunchRequest) (*incus.Instance, error) {
+func (f *fakeIncus) Launch(ctx context.Context, req incus.LaunchRequest) (*incus.Instance, error) {
 	if f.launchEntered != nil {
 		select {
 		case <-f.launchEntered:
@@ -42,7 +42,11 @@ func (f *fakeIncus) Launch(_ context.Context, req incus.LaunchRequest) (*incus.I
 		}
 	}
 	if f.launchGate != nil {
-		<-f.launchGate
+		select {
+		case <-f.launchGate:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -125,7 +129,7 @@ type fakeResolver struct {
 	err error
 }
 
-func (f *fakeResolver) Resolve(_ context.Context) (runner.Release, error) {
+func (f *fakeResolver) Resolve(_ context.Context, _ string) (runner.Release, error) {
 	return f.rel, f.err
 }
 
@@ -202,9 +206,16 @@ func newTestOrchestrator(t *testing.T, mutate func(*Config)) (*Orchestrator, *fa
 			RunnerGroup: "Default",
 			MaxRunners:  10,
 			BaseLabels:  []string{"incuse-test"},
+			Runner: config.RunnerSpec{
+				VCPUs: 1, MemoryMB: 4096, DiskGB: 40, Arch: config.ArchAMD64,
+			},
 		},
 	}
-	resolver := &fakeResolver{rel: runner.Release{Version: "2.328.0", DownloadURL: "https://example/x64.tgz"}}
+	resolver := &fakeResolver{rel: runner.Release{
+		Version:     "2.328.0",
+		DownloadURL: "https://example/x64.tgz",
+		SHA256:      "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+	}}
 
 	var nameSeq atomic.Int64
 	cfg := Config{
@@ -214,19 +225,18 @@ func newTestOrchestrator(t *testing.T, mutate func(*Config)) (*Orchestrator, *fa
 		IncusCfg: config.IncusConfig{
 			Project:        "incuse",
 			DefaultProfile: "incuse-runner",
+			StoragePool:    "runners",
 		},
 		RunnerCfg: config.RunnerConfig{
 			ImageServer:         "https://images.linuxcontainers.org",
 			ImageProtocol:       "simplestreams",
 			ImageAlias:          "ubuntu/24.04/cloud",
 			WorkFolder:          "_work",
-			VCPUTiers:           []int{1, 2, 4},
-			MemoryPerVCPUMiB:    4096,
-			RootDiskGiB:         40,
 			RegistrationTimeout: 10 * time.Minute,
 			MaxJobDuration:      6 * time.Hour,
+			MaxParallelMints:    4,
+			MaxParallelLaunches: 2,
 		},
-		HostArch:     "amd64",
 		Logger:       discardLogger(),
 		ReapInterval: time.Hour,
 		Now:          clk.Now,
@@ -281,16 +291,20 @@ func waitForTrackerSize(t *testing.T, o *Orchestrator, want int) {
 func TestNew_Validation(t *testing.T) {
 	validBase := func() Config {
 		return Config{
-			IncusClient:     &fakeIncus{},
-			ScaleSet:        &fakeScaleSet{spec: config.ScaleSetConfig{MaxRunners: 1}},
+			IncusClient: &fakeIncus{},
+			ScaleSet: &fakeScaleSet{spec: config.ScaleSetConfig{
+				MaxRunners: 1,
+				Runner: config.RunnerSpec{
+					VCPUs: 1, MemoryMB: 1024, DiskGB: 10, Arch: config.ArchAMD64,
+				},
+			}},
 			ReleaseResolver: &fakeResolver{},
 			IncusCfg:        config.IncusConfig{Project: "p", DefaultProfile: "pr"},
 			RunnerCfg: config.RunnerConfig{
 				RegistrationTimeout: time.Minute,
 				MaxJobDuration:      time.Hour,
-				VCPUTiers:           []int{1},
-				MemoryPerVCPUMiB:    1024,
-				RootDiskGiB:         10,
+				MaxParallelMints:    1,
+				MaxParallelLaunches: 1,
 			},
 			Logger: discardLogger(),
 		}
@@ -309,7 +323,8 @@ func TestNew_Validation(t *testing.T) {
 		{"missing profile", func(c *Config) { c.IncusCfg.DefaultProfile = "" }, "default_profile"},
 		{"missing registration timeout", func(c *Config) { c.RunnerCfg.RegistrationTimeout = 0 }, "registration_timeout"},
 		{"missing max job duration", func(c *Config) { c.RunnerCfg.MaxJobDuration = 0 }, "max_job_duration"},
-		{"missing vcpu tiers", func(c *Config) { c.RunnerCfg.VCPUTiers = nil }, "vcpu_tiers"},
+		{"missing mint concurrency", func(c *Config) { c.RunnerCfg.MaxParallelMints = 0 }, "max_parallel_mints"},
+		{"missing launch concurrency", func(c *Config) { c.RunnerCfg.MaxParallelLaunches = 0 }, "max_parallel_launches"},
 		{"max runners zero", func(c *Config) { c.ScaleSet = &fakeScaleSet{spec: config.ScaleSetConfig{MaxRunners: 0}} }, "max_runners"},
 	}
 	for _, tc := range cases {
@@ -324,7 +339,7 @@ func TestNew_Validation(t *testing.T) {
 	}
 }
 
-func TestHandleDesiredRunnerCount_SpawnsAtSmallestTier(t *testing.T) {
+func TestHandleDesiredRunnerCount_SpawnsConfiguredClass(t *testing.T) {
 	o, fi, fs, _ := newTestOrchestrator(t, nil)
 	got, err := o.HandleDesiredRunnerCount(t.Context(), 3)
 	if err != nil {
@@ -340,7 +355,7 @@ func TestHandleDesiredRunnerCount_SpawnsAtSmallestTier(t *testing.T) {
 	launches, _, _ := fi.snapshot()
 	for _, req := range launches {
 		if got := req.Config["limits.cpu"]; got != "1" {
-			t.Errorf("limits.cpu: want 1 (smallest tier), got %q", got)
+			t.Errorf("limits.cpu: want configured class value 1, got %q", got)
 		}
 		if got := req.Config[metaManaged]; got != "true" {
 			t.Errorf("%s: want true, got %q", metaManaged, got)
@@ -353,7 +368,13 @@ func TestHandleDesiredRunnerCount_SpawnsAtSmallestTier(t *testing.T) {
 
 func TestHandleDesiredRunnerCount_CapsAtMaxRunners(t *testing.T) {
 	o, fi, _, _ := newTestOrchestrator(t, func(c *Config) {
-		c.ScaleSet = &fakeScaleSet{spec: config.ScaleSetConfig{Name: "incuse-test", MaxRunners: 2}}
+		c.ScaleSet = &fakeScaleSet{spec: config.ScaleSetConfig{
+			Name:       "incuse-test",
+			MaxRunners: 2,
+			Runner: config.RunnerSpec{
+				VCPUs: 1, MemoryMB: 4096, DiskGB: 40, Arch: config.ArchAMD64,
+			},
+		}}
 	})
 	got, err := o.HandleDesiredRunnerCount(t.Context(), 5)
 	if err != nil {
@@ -387,6 +408,25 @@ func TestHandleDesiredRunnerCount_NegativeIsZero(t *testing.T) {
 	got, _ := o.HandleDesiredRunnerCount(t.Context(), -3)
 	if got != 0 {
 		t.Errorf("want 0, got %d", got)
+	}
+}
+
+func TestMakeRunnerNameSanitizesAndPreservesSuffix(t *testing.T) {
+	got := makeRunnerName(
+		"INCUSE_bad/class_with_a_name_that_is_much_too_long_for_incus",
+		"ABC_1234",
+	)
+	if len(got) > 63 {
+		t.Fatalf("name too long: %d: %q", len(got), got)
+	}
+	if got[len(got)-8:] != "abc-1234" {
+		t.Fatalf("suffix not preserved: %q", got)
+	}
+	for _, r := range got {
+		if r != '-' && (r < 'a' || r > 'z') &&
+			(r < '0' || r > '9') {
+			t.Fatalf("invalid character %q in %q", r, got)
+		}
 	}
 }
 
@@ -555,7 +595,22 @@ func TestReap_MaxJobDurationForBusyRunner(t *testing.T) {
 func TestReap_DriftSweepDeletesOrphanManagedInstances(t *testing.T) {
 	o, fi, _, _ := newTestOrchestrator(t, nil)
 	fi.remote = []incus.Instance{
-		{Name: "orphan-managed", Status: "Running", Config: map[string]string{metaManaged: "true"}},
+		{
+			Name:   "orphan-managed",
+			Status: "Running",
+			Config: map[string]string{
+				metaManaged:    "true",
+				metaScaleSetID: "42",
+			},
+		},
+		{
+			Name:   "another-class",
+			Status: "Running",
+			Config: map[string]string{
+				metaManaged:    "true",
+				metaScaleSetID: "43",
+			},
+		},
 		{Name: "not-ours", Status: "Running", Config: map[string]string{}},
 	}
 	o.reapOnce(t.Context())
@@ -579,7 +634,14 @@ func TestReap_DriftSweepIgnoresInstancesInTracker(t *testing.T) {
 
 	fi.mu.Lock()
 	fi.remote = []incus.Instance{
-		{Name: "incuse-test-aaaa", Status: "Running", Config: map[string]string{metaManaged: "true"}},
+		{
+			Name:   "incuse-test-aaaa",
+			Status: "Running",
+			Config: map[string]string{
+				metaManaged:    "true",
+				metaScaleSetID: "42",
+			},
+		},
 	}
 	fi.mu.Unlock()
 	// Don't touch reapOnce stop/delete count via the registration
@@ -604,6 +666,36 @@ func TestRun_StopsOnContextCancel(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("Run did not stop on cancel")
+	}
+}
+
+func TestRun_CancelJoinsInflightLaunch(t *testing.T) {
+	o, fi, _, _ := newTestOrchestrator(t, nil)
+	fi.launchGate = make(chan struct{})
+	fi.launchEntered = make(chan struct{})
+
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() { done <- o.Run(ctx) }()
+	if _, err := o.HandleDesiredRunnerCount(ctx, 1); err != nil {
+		t.Fatalf("desired count: %v", err)
+	}
+	select {
+	case <-fi.launchEntered:
+	case <-time.After(time.Second):
+		t.Fatal("launch did not start")
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("run error: got %v, want context.Canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Run returned before joining the launch task")
+	}
+	if got := o.tracker.size(); got != 0 {
+		t.Fatalf("tracker size: got %d, want 0", got)
 	}
 }
 

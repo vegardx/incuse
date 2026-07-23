@@ -34,7 +34,25 @@
 set -euo pipefail
 
 RUNNER_VERSION="${RUNNER_VERSION:?set RUNNER_VERSION (e.g. 2.334.0)}"
-RUNNER_SHA256="${RUNNER_SHA256:?set RUNNER_SHA256 for the linux-x64 tarball}"
+RUNNER_SHA256="${RUNNER_SHA256:?set RUNNER_SHA256 for the selected runner architecture}"
+case "${RUNNER_ARCH:-$(uname -m)}" in
+	amd64|x86_64)
+		RUNNER_ARCH=amd64
+		RUNNER_ASSET_ARCH=x64
+		TOOL_ARCH=x64
+		GO_ASSET_ARCH=amd64
+		;;
+	arm64|aarch64)
+		RUNNER_ARCH=arm64
+		RUNNER_ASSET_ARCH=arm64
+		TOOL_ARCH=arm64
+		GO_ASSET_ARCH=arm64
+		;;
+	*)
+		echo "RUNNER_ARCH must be amd64 or arm64" >&2
+		exit 2
+		;;
+esac
 INCUS_PROJECT="${INCUS_PROJECT:-incuse}"
 BUILD_NAME="${BUILD_NAME:-incuse-builder}"
 BASE_IMAGE="${BASE_IMAGE:-images:ubuntu/24.04/cloud}"
@@ -84,6 +102,12 @@ incus launch "$BASE_IMAGE" "$BUILD_NAME" \
 	--project "$INCUS_PROJECT" \
 	--profile "$BUILD_PROFILE"
 
+cleanup_builder() {
+	incus stop --force --project "$INCUS_PROJECT" "$BUILD_NAME" >/dev/null 2>&1 || true
+	incus delete --project "$INCUS_PROJECT" "$BUILD_NAME" >/dev/null 2>&1 || true
+}
+trap cleanup_builder EXIT
+
 echo "==> waiting for incus-agent / exec readiness"
 for _ in $(seq 1 90); do
 	if incus exec --project "$INCUS_PROJECT" "$BUILD_NAME" -- true 2>/dev/null; then
@@ -101,6 +125,9 @@ incus exec --project "$INCUS_PROJECT" "$BUILD_NAME" \
 	--env "WITH_DOCKER=$WITH_DOCKER" \
 	--env "RUNNER_VERSION=$RUNNER_VERSION" \
 	--env "RUNNER_SHA256=$RUNNER_SHA256" \
+	--env "RUNNER_ASSET_ARCH=$RUNNER_ASSET_ARCH" \
+	--env "TOOL_ARCH=$TOOL_ARCH" \
+	--env "GO_ASSET_ARCH=$GO_ASSET_ARCH" \
 	--env "TOOLCACHE_NODE_VERSIONS=$TOOLCACHE_NODE_VERSIONS" \
 	--env "TOOLCACHE_PYTHON_VERSIONS=$TOOLCACHE_PYTHON_VERSIONS" \
 	--env "TOOLCACHE_GO_VERSIONS=$TOOLCACHE_GO_VERSIONS" \
@@ -129,7 +156,7 @@ chmod 0440 /etc/sudoers.d/runner
 # actions/runner tarball
 install -d -o runner -g runner -m 0755 /opt/runner /opt/runner/_work
 cd /tmp
-curl -fsSL "https://github.com/actions/runner/releases/download/v${RUNNER_VERSION}/actions-runner-linux-x64-${RUNNER_VERSION}.tar.gz" -o runner.tgz
+curl -fsSL "https://github.com/actions/runner/releases/download/v${RUNNER_VERSION}/actions-runner-linux-${RUNNER_ASSET_ARCH}-${RUNNER_VERSION}.tar.gz" -o runner.tgz
 echo "${RUNNER_SHA256}  runner.tgz" | sha256sum -c -
 tar -xzf runner.tgz -C /opt/runner
 chown -R runner:runner /opt/runner
@@ -151,7 +178,8 @@ install -d -o runner -g runner -m 0755 /opt/hostedtoolcache
 for spec in $TOOLCACHE_NODE_VERSIONS; do
 	if [[ "$spec" =~ ^[0-9]+$ ]]; then
 		ver=$(curl -fsSL "https://nodejs.org/dist/latest-v${spec}.x/SHASUMS256.txt" \
-			| awk '/linux-x64\.tar\.xz$/ {print $2; exit}' \
+			| awk -v arch="$RUNNER_ASSET_ARCH" \
+				'$2 ~ "linux-" arch "\\.tar\\.xz$" {print $2; exit}' \
 			| sed -E 's/^node-v([0-9.]+)-.*/\1/')
 	else
 		ver="$spec"
@@ -160,12 +188,20 @@ for spec in $TOOLCACHE_NODE_VERSIONS; do
 		echo "could not resolve Node $spec" >&2; exit 1
 	fi
 	echo "  -> Node $ver"
-	dir="/opt/hostedtoolcache/node/$ver/x64"
+	dir="/opt/hostedtoolcache/node/$ver/$TOOL_ARCH"
 	install -d -o runner -g runner -m 0755 "$dir"
-	curl -fsSL "https://nodejs.org/dist/v$ver/node-v$ver-linux-x64.tar.xz" \
-		| tar -xJ --strip-components=1 -C "$dir"
+	node_file="node-v$ver-linux-$RUNNER_ASSET_ARCH.tar.xz"
+	node_sum=$(curl -fsSL "https://nodejs.org/dist/v$ver/SHASUMS256.txt" \
+		| awk -v file="$node_file" '$2 == file {print $1}')
+	if [[ -z "$node_sum" ]]; then
+		echo "could not resolve checksum for Node $ver" >&2; exit 1
+	fi
+	curl -fsSL "https://nodejs.org/dist/v$ver/$node_file" -o "/tmp/$node_file"
+	echo "$node_sum  /tmp/$node_file" | sha256sum -c -
+	tar -xJ --strip-components=1 -C "$dir" -f "/tmp/$node_file"
+	rm -f "/tmp/$node_file"
 	chown -R runner:runner "/opt/hostedtoolcache/node/$ver"
-	touch "/opt/hostedtoolcache/node/$ver/x64.complete"
+	touch "/opt/hostedtoolcache/node/$ver/$TOOL_ARCH.complete"
 done
 
 # Python — actions/python-versions prebuilt tarballs. Their release
@@ -190,15 +226,27 @@ for spec in $TOOLCACHE_PYTHON_VERSIONS; do
 	fi
 	ver="${tag%%-*}"
 	echo "  -> Python $ver (tag=$tag)"
-	dir="/opt/hostedtoolcache/Python/$ver/x64"
+	dir="/opt/hostedtoolcache/Python/$ver/$TOOL_ARCH"
 	install -d -o runner -g runner -m 0755 "$dir"
-	curl -fsSL "https://github.com/actions/python-versions/releases/download/$tag/python-$ver-linux-24.04-x64.tar.gz" \
-		| tar -xz -C "$dir"
+	python_file="python-$ver-linux-24.04-$TOOL_ARCH.tar.gz"
+	python_release=$(curl -fsSL \
+		"https://api.github.com/repos/actions/python-versions/releases/tags/$tag")
+	python_url=$(echo "$python_release" | jq -r --arg file "$python_file" \
+		'.assets[] | select(.name == $file) | .browser_download_url')
+	python_sum=$(echo "$python_release" | jq -r --arg file "$python_file" \
+		'.assets[] | select(.name == $file) | .digest // "" | sub("^sha256:"; "")')
+	if [[ -z "$python_url" || ${#python_sum} -ne 64 ]]; then
+		echo "missing asset URL or digest for Python $tag" >&2; exit 1
+	fi
+	curl -fsSL "$python_url" -o "/tmp/$python_file"
+	echo "$python_sum  /tmp/$python_file" | sha256sum -c -
+	tar -xz -C "$dir" -f "/tmp/$python_file"
+	rm -f "/tmp/$python_file"
 	if [[ -x "$dir/setup.sh" ]]; then
 		(cd "$dir" && ./setup.sh)
 	fi
 	chown -R runner:runner "/opt/hostedtoolcache/Python/$ver"
-	touch "/opt/hostedtoolcache/Python/$ver/x64.complete"
+	touch "/opt/hostedtoolcache/Python/$ver/$TOOL_ARCH.complete"
 done
 
 # Go — official tarballs from go.dev/dl. The /?mode=json endpoint
@@ -220,16 +268,24 @@ for spec in $TOOLCACHE_GO_VERSIONS; do
 		echo "could not resolve Go $spec" >&2; exit 1
 	fi
 	echo "  -> Go $ver"
-	dir="/opt/hostedtoolcache/go/$ver/x64"
+	dir="/opt/hostedtoolcache/go/$ver/$TOOL_ARCH"
 	install -d -o runner -g runner -m 0755 "$dir"
-	curl -fsSL "https://go.dev/dl/go$ver.linux-amd64.tar.gz" \
-		| tar -xz --strip-components=1 -C "$dir"
+	go_file="go$ver.linux-$GO_ASSET_ARCH.tar.gz"
+	go_sum=$(echo "$GO_RELEASES" | jq -r --arg file "$go_file" \
+		'.[].files[] | select(.filename == $file) | .sha256')
+	if [[ ${#go_sum} -ne 64 ]]; then
+		echo "could not resolve checksum for Go $ver" >&2; exit 1
+	fi
+	curl -fsSL "https://go.dev/dl/$go_file" -o "/tmp/$go_file"
+	echo "$go_sum  /tmp/$go_file" | sha256sum -c -
+	tar -xz --strip-components=1 -C "$dir" -f "/tmp/$go_file"
+	rm -f "/tmp/$go_file"
 	chown -R runner:runner "/opt/hostedtoolcache/go/$ver"
-	touch "/opt/hostedtoolcache/go/$ver/x64.complete"
+	touch "/opt/hostedtoolcache/go/$ver/$TOOL_ARCH.complete"
 done
 
-# System CLIs — gh, aws, az — installed to /usr/local/bin so they're
-# on PATH for any user without setup actions.
+# System CLIs — gh, aws, az — installed from signed apt repositories
+# so they're on PATH for any user without setup actions.
 echo "  -> gh"
 mkdir -p -m 755 /etc/apt/keyrings
 curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
@@ -241,13 +297,16 @@ apt-get update
 apt-get install -y gh
 
 echo "  -> aws CLI v2"
-curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscliv2.zip
-unzip -q /tmp/awscliv2.zip -d /tmp
-/tmp/aws/install
-rm -rf /tmp/aws /tmp/awscliv2.zip
+apt-get install -y awscli
 
 echo "  -> Azure CLI"
-curl -fsSL https://aka.ms/InstallAzureCLIDeb | bash
+curl -fsSL https://packages.microsoft.com/keys/microsoft.asc \
+	| gpg --dearmor -o /etc/apt/keyrings/microsoft.gpg
+chmod go+r /etc/apt/keyrings/microsoft.gpg
+echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/microsoft.gpg] https://packages.microsoft.com/repos/azure-cli/ $(lsb_release -cs) main" \
+	> /etc/apt/sources.list.d/azure-cli.list
+apt-get update
+apt-get install -y azure-cli
 
 apt-get autoremove -y
 apt-get clean
@@ -345,6 +404,7 @@ incus image alias create --project "$INCUS_PROJECT" "$IMAGE_ALIAS_LATEST" "$FING
 
 echo "==> deleting build instance"
 incus delete --project "$INCUS_PROJECT" "$BUILD_NAME"
+trap - EXIT
 
 echo "==> done"
 incus image list --project "$INCUS_PROJECT"

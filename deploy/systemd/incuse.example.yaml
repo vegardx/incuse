@@ -28,27 +28,32 @@ github:
     #   private_key_file: /etc/incuse/github-app.pem
     #   installation_id: 12345678
 
-scale_set:
-  # Name of the scale set as it will appear on GitHub. Used as the
-  # default runner-group label and as the prefix for runner names.
-  name: incuse-rocket
-
+scale_sets:
+  # Every class becomes one homogeneous scale set named:
+  # <prefix>-<vcpu>vcpu-<memory>gb-<disk>gb-<arch>
+  prefix: incuse
   # Pre-created via the GitHub UI or `gh api`. `Default` is the auto-
   # created group every org has.
   runner_group: Default
 
-  # Hard cap on concurrent runners (Incus VMs). The orchestrator
-  # advertises min(github-desired, max_runners) on every poll so
-  # GitHub never assigns past this.
-  max_runners: 4
-
-  # Free-form labels that always apply, in addition to the auto-
-  # generated `vcpu=N` and `arch=X` labels. Job runs-on must intersect
-  # this set ∪ the auto-generated set for GitHub to route to us.
+  # Shared labels. The generated scale-set name is always added.
   base_labels:
-    - incuse-rocket
     - self-hosted
     - linux
+
+  # Use the generated name in runs-on, for example:
+  # runs-on: incuse-4vcpu-8gb-20gb-amd64
+  classes:
+    - vcpus: 2
+      memory_gib: 4
+      disk_gib: 20
+      arch: amd64
+      max_runners: 4
+    - vcpus: 4
+      memory_gib: 8
+      disk_gib: 20
+      arch: amd64
+      max_runners: 2
 
 incus:
   # Empty url + populated socket_path = Unix-socket transport (default).
@@ -72,6 +77,13 @@ incus:
   # docs/runner-image.md (sized via per-launch overrides).
   default_profile: incuse-runner
 
+  # The root disk is attached from this pool explicitly.
+  storage_pool: default
+
+  # Bounds REST calls in the Incus client, including upstream methods
+  # that do not expose a per-call context.
+  request_timeout: 10m
+
 runner:
   # Public images.linuxcontainers.org. Override if you mirror
   # internally.
@@ -81,35 +93,31 @@ runner:
   # MVP: closest match to GitHub-hosted ubuntu-latest.
   image_alias: ubuntu/24.04/cloud
 
-  # Pin the actions/runner release. Bump in lock-step with sha256.
-  runner_version: "2.328.0"
-  runner_sha256: "01a2c8a45c45ea3d7d3c1f2c77d3a2f25b27e90ce6fb8b78bcb8b9f11a1234ab"
+  # Refresh the public actions/runner latest-release metadata hourly.
+  # GitHub's published SHA-256 digest is verified before extraction.
+  # The last good cached release is used if a refresh fails. Zero
+  # disables both caching and fallback and requests once per spawn.
+  release_cache_ttl: 1h
 
   # When true, incuse uses the minimal cloud-init template and assumes
   # the image already has actions/runner, the runner user, packages,
   # and /etc/systemd/system/incuse-runner.service installed. Build
-  # such an image with scripts/build-runner-image.sh.
+  # such an image with scripts/build-runner-image.sh. A local alias
+  # targets one image, so baked-image classes must share one arch.
   use_baked_image: false
 
   # Path inside the runner VM where actions check out the repo.
   work_folder: _work
-
-  # vCPU sizes the orchestrator advertises (one `vcpu=N` label per
-  # tier). A job with no `vcpu=` label gets the smallest tier.
-  vcpu_tiers: [1, 2, 4]
-
-  # Memory and disk are derived from the picked tier:
-  #   memory = vcpu * memory_per_vcpu_mib
-  #   disk   = root_disk_gib (per-instance override; profile defines
-  #            the storage pool).
-  memory_per_vcpu_mib: 4096
-  root_disk_gib: 40
 
   # Hard timeouts. Tune the registration timeout from the manual smoke
   # test in docs/runner-image.md (VM cold-boot is ~60-90s on rocket,
   # plus cloud-init).
   registration_timeout: 10m
   max_job_duration: 6h
+
+  # JIT preparation and Incus creates are independently bounded.
+  max_parallel_mints: 4
+  max_parallel_launches: 2
 
   # Instance type the orchestrator launches per job. Default is `vm`
   # (full hypervisor isolation; ~30s cold-boot; docker just works).

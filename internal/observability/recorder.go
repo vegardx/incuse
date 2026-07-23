@@ -4,7 +4,7 @@
 //   - implements sslistener.MetricsRecorder so the upstream listener
 //     populates GitHub-side gauges/counters automatically;
 //   - exposes incuse-specific Record* methods the orchestrator calls
-//     from Mint, dispatchLaunch, terminateInstance, and the reaper;
+//     from mint, launch, termination, and reaper paths;
 //   - holds a *prometheus.Registry so the http server can scrape it
 //     without touching globals.
 //
@@ -25,8 +25,8 @@ type Recorder struct {
 	registry *prometheus.Registry
 
 	// Job lifecycle counters.
-	runnersSpawned prometheus.Counter
-	jobsStarted    prometheus.Counter
+	runnersSpawned *prometheus.CounterVec
+	jobsStarted    *prometheus.CounterVec
 	jobsCompleted  *prometheus.CounterVec
 
 	// Launch + reap.
@@ -34,21 +34,21 @@ type Recorder struct {
 	reaps    *prometheus.CounterVec
 
 	// Latency histograms.
-	launchDuration prometheus.Histogram
-	runnerLifetime prometheus.Histogram
+	launchDuration *prometheus.HistogramVec
+	runnerLifetime *prometheus.HistogramVec
 
 	// Live state.
-	trackedInstances prometheus.Gauge
-	desiredRunners   prometheus.Gauge
+	trackedInstances *prometheus.GaugeVec
+	desiredRunners   *prometheus.GaugeVec
 
 	// GitHub-side state mirrored from RunnerScaleSetStatistic.
-	statTotalAvailableJobs     prometheus.Gauge
-	statTotalAcquiredJobs      prometheus.Gauge
-	statTotalAssignedJobs      prometheus.Gauge
-	statTotalRunningJobs       prometheus.Gauge
-	statTotalRegisteredRunners prometheus.Gauge
-	statTotalBusyRunners       prometheus.Gauge
-	statTotalIdleRunners       prometheus.Gauge
+	statTotalAvailableJobs     *prometheus.GaugeVec
+	statTotalAcquiredJobs      *prometheus.GaugeVec
+	statTotalAssignedJobs      *prometheus.GaugeVec
+	statTotalRunningJobs       *prometheus.GaugeVec
+	statTotalRegisteredRunners *prometheus.GaugeVec
+	statTotalBusyRunners       *prometheus.GaugeVec
+	statTotalIdleRunners       *prometheus.GaugeVec
 
 	// Build-info gauge — convenient for "what version is running".
 	buildInfo *prometheus.GaugeVec
@@ -60,57 +60,57 @@ func New(version, commit string) *Recorder {
 	r := prometheus.NewRegistry()
 	rec := &Recorder{
 		registry: r,
-		runnersSpawned: prometheus.NewCounter(prometheus.CounterOpts{
+		runnersSpawned: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: "incuse",
 			Name:      "runners_spawned_total",
 			Help:      "Number of idle runners incuse has spawned to satisfy GitHub's desired-runner-count.",
-		}),
-		jobsStarted: prometheus.NewCounter(prometheus.CounterOpts{
+		}, []string{"scale_set"}),
+		jobsStarted: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: "incuse",
 			Name:      "jobs_started_total",
 			Help:      "Number of GitHub JobStarted messages observed.",
-		}),
+		}, []string{"scale_set"}),
 		jobsCompleted: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: "incuse",
 			Name:      "jobs_completed_total",
 			Help:      "Number of GitHub JobCompleted messages observed.",
-		}, []string{"result"}),
+		}, []string{"scale_set", "result"}),
 		launches: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: "incuse",
 			Name:      "launches_total",
 			Help:      "Incus VM launch attempts.",
-		}, []string{"result"}),
+		}, []string{"scale_set", "result"}),
 		reaps: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: "incuse",
 			Name:      "reaps_total",
 			Help:      "Reaper terminations bucketed by reason.",
-		}, []string{"reason"}),
-		launchDuration: prometheus.NewHistogram(prometheus.HistogramOpts{
+		}, []string{"scale_set", "reason"}),
+		launchDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
 			Namespace: "incuse",
 			Name:      "launch_duration_seconds",
 			Help:      "Time spent inside IncusClient.Launch (create+start operation).",
 			// VM cold-boot on commodity hardware lands in 5-30s; widen
 			// past that to catch image pulls and slow daemons.
 			Buckets: []float64{1, 2, 5, 10, 20, 30, 60, 120, 300},
-		}),
-		runnerLifetime: prometheus.NewHistogram(prometheus.HistogramOpts{
+		}, []string{"scale_set"}),
+		runnerLifetime: prometheus.NewHistogramVec(prometheus.HistogramOpts{
 			Namespace: "incuse",
 			Name:      "runner_lifetime_seconds",
-			Help:      "End-to-end VM lifetime: JobAssigned to terminate.",
+			Help:      "End-to-end runner lifetime: JIT mint to termination.",
 			// Job durations are bimodal: <2 min for unit tests, hours
 			// for builds. Buckets cover both.
 			Buckets: []float64{30, 60, 120, 300, 600, 1800, 3600, 7200, 21600},
-		}),
-		trackedInstances: prometheus.NewGauge(prometheus.GaugeOpts{
+		}, []string{"scale_set"}),
+		trackedInstances: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Namespace: "incuse",
 			Name:      "tracked_instances",
 			Help:      "Instances currently in the orchestrator's in-memory tracker.",
-		}),
-		desiredRunners: prometheus.NewGauge(prometheus.GaugeOpts{
+		}, []string{"scale_set"}),
+		desiredRunners: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Namespace: "incuse",
 			Name:      "desired_runners",
 			Help:      "Most recent desired-runner-count GitHub asked for.",
-		}),
+		}, []string{"scale_set"}),
 		statTotalAvailableJobs:     newStatGauge("total_available_jobs"),
 		statTotalAcquiredJobs:      newStatGauge("total_acquired_jobs"),
 		statTotalAssignedJobs:      newStatGauge("total_assigned_jobs"),
@@ -148,13 +148,13 @@ func New(version, commit string) *Recorder {
 	return rec
 }
 
-func newStatGauge(name string) prometheus.Gauge {
-	return prometheus.NewGauge(prometheus.GaugeOpts{
+func newStatGauge(name string) *prometheus.GaugeVec {
+	return prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Namespace: "incuse",
 		Subsystem: "scaleset",
 		Name:      name,
 		Help:      "Mirrors the corresponding RunnerScaleSetStatistic field from the upstream API.",
-	})
+	}, []string{"scale_set"})
 }
 
 // Registry returns the underlying registry so the http server can hand
@@ -163,39 +163,77 @@ func (r *Recorder) Registry() *prometheus.Registry {
 	return r.registry
 }
 
+// ScaleSetRecorder binds every observation to one bounded class label.
+type ScaleSetRecorder struct {
+	recorder *Recorder
+	name     string
+}
+
+// ForScaleSet returns the listener and orchestrator metrics hooks for
+// one homogeneous runner class.
+func (r *Recorder) ForScaleSet(name string) *ScaleSetRecorder {
+	r.trackedInstances.WithLabelValues(name)
+	r.desiredRunners.WithLabelValues(name)
+	r.statTotalAvailableJobs.WithLabelValues(name)
+	r.statTotalAcquiredJobs.WithLabelValues(name)
+	r.statTotalAssignedJobs.WithLabelValues(name)
+	r.statTotalRunningJobs.WithLabelValues(name)
+	r.statTotalRegisteredRunners.WithLabelValues(name)
+	r.statTotalBusyRunners.WithLabelValues(name)
+	r.statTotalIdleRunners.WithLabelValues(name)
+	return &ScaleSetRecorder{recorder: r, name: name}
+}
+
 // --- sslistener.MetricsRecorder ---------------------------------------
 
 // RecordStatistics is invoked by the upstream listener with every
 // poll-cycle statistics payload.
 func (r *Recorder) RecordStatistics(s *ssapi.RunnerScaleSetStatistic) {
+	r.ForScaleSet("").RecordStatistics(s)
+}
+
+func (r *ScaleSetRecorder) RecordStatistics(s *ssapi.RunnerScaleSetStatistic) {
 	if s == nil {
 		return
 	}
-	r.statTotalAvailableJobs.Set(float64(s.TotalAvailableJobs))
-	r.statTotalAcquiredJobs.Set(float64(s.TotalAcquiredJobs))
-	r.statTotalAssignedJobs.Set(float64(s.TotalAssignedJobs))
-	r.statTotalRunningJobs.Set(float64(s.TotalRunningJobs))
-	r.statTotalRegisteredRunners.Set(float64(s.TotalRegisteredRunners))
-	r.statTotalBusyRunners.Set(float64(s.TotalBusyRunners))
-	r.statTotalIdleRunners.Set(float64(s.TotalIdleRunners))
+	r.recorder.statTotalAvailableJobs.WithLabelValues(r.name).Set(float64(s.TotalAvailableJobs))
+	r.recorder.statTotalAcquiredJobs.WithLabelValues(r.name).Set(float64(s.TotalAcquiredJobs))
+	r.recorder.statTotalAssignedJobs.WithLabelValues(r.name).Set(float64(s.TotalAssignedJobs))
+	r.recorder.statTotalRunningJobs.WithLabelValues(r.name).Set(float64(s.TotalRunningJobs))
+	r.recorder.statTotalRegisteredRunners.WithLabelValues(r.name).Set(float64(s.TotalRegisteredRunners))
+	r.recorder.statTotalBusyRunners.WithLabelValues(r.name).Set(float64(s.TotalBusyRunners))
+	r.recorder.statTotalIdleRunners.WithLabelValues(r.name).Set(float64(s.TotalIdleRunners))
 }
 
 // RecordJobStarted bumps the started counter.
-func (r *Recorder) RecordJobStarted(_ *ssapi.JobStarted) {
-	r.jobsStarted.Inc()
+func (r *Recorder) RecordJobStarted(event *ssapi.JobStarted) {
+	r.ForScaleSet("").RecordJobStarted(event)
 }
 
-// RecordJobCompleted bumps the completed counter. The upstream
-// listener doesn't surface a success/failure flag in the message, so
-// we bucket every completion as `result="seen"` and rely on
-// orchestrator-side reap counters for failure modes.
-func (r *Recorder) RecordJobCompleted(_ *ssapi.JobCompleted) {
-	r.jobsCompleted.WithLabelValues("seen").Inc()
+func (r *ScaleSetRecorder) RecordJobStarted(_ *ssapi.JobStarted) {
+	r.recorder.jobsStarted.WithLabelValues(r.name).Inc()
+}
+
+// RecordJobCompleted bumps the completed counter with GitHub's result.
+func (r *Recorder) RecordJobCompleted(event *ssapi.JobCompleted) {
+	r.ForScaleSet("").RecordJobCompleted(event)
+}
+
+func (r *ScaleSetRecorder) RecordJobCompleted(event *ssapi.JobCompleted) {
+	result := "unknown"
+	if event != nil && event.Result != "" {
+		result = event.Result
+	}
+	r.recorder.jobsCompleted.WithLabelValues(r.name, result).Inc()
 }
 
 // RecordDesiredRunners records the most recent runner-count target.
 func (r *Recorder) RecordDesiredRunners(count int) {
-	r.desiredRunners.Set(float64(count))
+	r.ForScaleSet("").RecordDesiredRunners(count)
+}
+
+func (r *ScaleSetRecorder) RecordDesiredRunners(count int) {
+	r.recorder.desiredRunners.WithLabelValues(r.name).Set(float64(count))
 }
 
 // --- incuse-side hooks ------------------------------------------------
@@ -203,34 +241,60 @@ func (r *Recorder) RecordDesiredRunners(count int) {
 // RunnerSpawned increments when the orchestrator has decided to mint
 // a new idle runner in response to GitHub's desired-runner-count.
 func (r *Recorder) RunnerSpawned() {
-	r.runnersSpawned.Inc()
+	r.ForScaleSet("").RunnerSpawned()
+}
+
+func (r *ScaleSetRecorder) RunnerSpawned() {
+	r.recorder.runnersSpawned.WithLabelValues(r.name).Inc()
 }
 
 // LaunchOK / LaunchFail bucket Incus launch outcomes.
-func (r *Recorder) LaunchOK()   { r.launches.WithLabelValues("ok").Inc() }
-func (r *Recorder) LaunchFail() { r.launches.WithLabelValues("fail").Inc() }
+func (r *Recorder) LaunchOK()   { r.ForScaleSet("").LaunchOK() }
+func (r *Recorder) LaunchFail() { r.ForScaleSet("").LaunchFail() }
+func (r *ScaleSetRecorder) LaunchOK() {
+	r.recorder.launches.WithLabelValues(r.name, "ok").Inc()
+}
+func (r *ScaleSetRecorder) LaunchFail() {
+	r.recorder.launches.WithLabelValues(r.name, "fail").Inc()
+}
 
 // LaunchDuration observes the wall-clock cost of one launch.
 func (r *Recorder) LaunchDuration(seconds float64) {
-	r.launchDuration.Observe(seconds)
+	r.ForScaleSet("").LaunchDuration(seconds)
 }
 
-// RunnerLifetime observes total VM lifetime from JobAssigned to
-// terminate (whatever the cause).
+func (r *ScaleSetRecorder) LaunchDuration(seconds float64) {
+	r.recorder.launchDuration.WithLabelValues(r.name).Observe(seconds)
+}
+
+// RunnerLifetime observes total VM lifetime from JIT mint to
+// termination (whatever the cause).
 func (r *Recorder) RunnerLifetime(seconds float64) {
-	r.runnerLifetime.Observe(seconds)
+	r.ForScaleSet("").RunnerLifetime(seconds)
+}
+
+func (r *ScaleSetRecorder) RunnerLifetime(seconds float64) {
+	r.recorder.runnerLifetime.WithLabelValues(r.name).Observe(seconds)
 }
 
 // Reap buckets a reaper termination by reason. Reasons used by the
 // orchestrator: "registration_timeout", "max_job_duration",
 // "drift_sweep", "job_completed".
 func (r *Recorder) Reap(reason string) {
-	r.reaps.WithLabelValues(reason).Inc()
+	r.ForScaleSet("").Reap(reason)
+}
+
+func (r *ScaleSetRecorder) Reap(reason string) {
+	r.recorder.reaps.WithLabelValues(r.name, reason).Inc()
 }
 
 // SetTrackedInstances overwrites the tracker-size gauge.
 func (r *Recorder) SetTrackedInstances(n int) {
-	r.trackedInstances.Set(float64(n))
+	r.ForScaleSet("").SetTrackedInstances(n)
+}
+
+func (r *ScaleSetRecorder) SetTrackedInstances(n int) {
+	r.recorder.trackedInstances.WithLabelValues(r.name).Set(float64(n))
 }
 
 // Discard returns a Recorder-shaped value that drops every observation

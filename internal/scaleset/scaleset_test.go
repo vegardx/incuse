@@ -19,9 +19,9 @@ import (
 type fakeAPI struct {
 	mu        sync.Mutex
 	created   []*ssapi.RunnerScaleSet
-	deleted   []int
+	updated   []*ssapi.RunnerScaleSet
 	createErr error
-	deleteErr error
+	updateErr error
 	createOut *ssapi.RunnerScaleSet
 }
 
@@ -40,11 +40,20 @@ func (f *fakeAPI) CreateRunnerScaleSet(_ context.Context, ss *ssapi.RunnerScaleS
 	return &out, nil
 }
 
-func (f *fakeAPI) DeleteRunnerScaleSet(_ context.Context, id int) error {
+func (f *fakeAPI) UpdateRunnerScaleSet(
+	_ context.Context,
+	id int,
+	ss *ssapi.RunnerScaleSet,
+) (*ssapi.RunnerScaleSet, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.deleted = append(f.deleted, id)
-	return f.deleteErr
+	f.updated = append(f.updated, ss)
+	if f.updateErr != nil {
+		return nil, f.updateErr
+	}
+	out := *ss
+	out.ID = id
+	return &out, nil
 }
 
 var _ scaleSetAPI = (*fakeAPI)(nil)
@@ -62,8 +71,8 @@ func TestReconcile_CreatesWhenAbsent(t *testing.T) {
 	if len(api.created) != 1 {
 		t.Fatalf("create call count: want 1, got %d", len(api.created))
 	}
-	if len(api.deleted) != 0 {
-		t.Errorf("must not delete when no existing scale set; got %v", api.deleted)
+	if len(api.updated) != 0 {
+		t.Errorf("must not update when no existing scale set; got %v", api.updated)
 	}
 	gotNames := make([]string, len(api.created[0].Labels))
 	for i, l := range api.created[0].Labels {
@@ -94,12 +103,12 @@ func TestReconcile_NoOpWhenLabelsMatch(t *testing.T) {
 	if got.ID != 42 {
 		t.Errorf("returned scale set: want existing ID=42, got %d", got.ID)
 	}
-	if len(api.created) != 0 || len(api.deleted) != 0 {
-		t.Errorf("no-op path must not call create/delete; created=%v deleted=%v", api.created, api.deleted)
+	if len(api.created) != 0 || len(api.updated) != 0 {
+		t.Errorf("no-op path must not mutate; created=%v updated=%v", api.created, api.updated)
 	}
 }
 
-func TestReconcile_DeletesAndRecreatesOnLabelDrift(t *testing.T) {
+func TestReconcile_UpdatesOnLabelDrift(t *testing.T) {
 	api := &fakeAPI{}
 	existing := &ssapi.RunnerScaleSet{
 		ID:   42,
@@ -112,14 +121,11 @@ func TestReconcile_DeletesAndRecreatesOnLabelDrift(t *testing.T) {
 	if _, err := reconcileScaleSet(t.Context(), api, "incuse", 7, existing, want, discardLogger()); err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}
-	if len(api.deleted) != 1 || api.deleted[0] != 42 {
-		t.Errorf("expected delete of stale id=42, got %v", api.deleted)
+	if len(api.updated) != 1 {
+		t.Fatalf("expected 1 update, got %d", len(api.updated))
 	}
-	if len(api.created) != 1 {
-		t.Fatalf("expected 1 recreate, got %d", len(api.created))
-	}
-	gotNames := make([]string, len(api.created[0].Labels))
-	for i, l := range api.created[0].Labels {
+	gotNames := make([]string, len(api.updated[0].Labels))
+	for i, l := range api.updated[0].Labels {
 		gotNames[i] = l.Name
 	}
 	sort.Strings(gotNames)
@@ -130,12 +136,12 @@ func TestReconcile_DeletesAndRecreatesOnLabelDrift(t *testing.T) {
 	}
 }
 
-func TestReconcile_PropagatesDeleteError(t *testing.T) {
-	api := &fakeAPI{deleteErr: errors.New("nope")}
+func TestReconcile_PropagatesUpdateError(t *testing.T) {
+	api := &fakeAPI{updateErr: errors.New("nope")}
 	existing := &ssapi.RunnerScaleSet{ID: 42, Labels: []ssapi.Label{{Name: "old"}}}
 	_, err := reconcileScaleSet(t.Context(), api, "incuse", 7, existing, []string{"new"}, discardLogger())
 	if err == nil {
-		t.Fatal("want delete error to propagate")
+		t.Fatal("want update error to propagate")
 	}
 }
 
@@ -212,8 +218,10 @@ func validOptions() Options {
 			RunnerGroup: "Default",
 			BaseLabels:  []string{"incuse"},
 			MaxRunners:  4,
+			Runner: config.RunnerSpec{
+				VCPUs: 1, MemoryMB: 1024, DiskGB: 20, Arch: config.ArchAMD64,
+			},
 		},
-		VCPUTiers:    []int{1, 2, 4},
 		ConfigureURL: "https://github.com/netwerk-io",
 		PAT:          "ghp_test",
 		Logger:       discardLogger(),
@@ -231,7 +239,7 @@ func TestNew_ValidationFailures(t *testing.T) {
 		{"missing configure_url", func(o *Options) { o.ConfigureURL = "" }, "configure_url is required"},
 		{"missing scale set name", func(o *Options) { o.Spec.Name = "" }, "scale_set.name is required"},
 		{"missing runner group", func(o *Options) { o.Spec.RunnerGroup = "" }, "scale_set.runner_group is required"},
-		{"missing vcpu tiers", func(o *Options) { o.VCPUTiers = nil }, "vcpu_tiers"},
+		{"missing class label", func(o *Options) { o.Spec.BaseLabels = nil }, "base_labels"},
 		{
 			"app mode without client_id",
 			func(o *Options) { o.PAT = ""; o.AppPrivateKeyPEM = "pem"; o.AppInstallationID = 1 },

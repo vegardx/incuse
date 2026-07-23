@@ -51,8 +51,9 @@ func TestIntegration_LaunchStopDelete(t *testing.T) {
 	})
 
 	if _, err := c.Launch(ctx, LaunchRequest{
-		Name: name,
-		Type: InstanceTypeVM,
+		Name:         name,
+		Architecture: "amd64",
+		Type:         InstanceTypeVM,
 		Image: ImageSource{
 			Server:   "https://images.linuxcontainers.org",
 			Protocol: "simplestreams",

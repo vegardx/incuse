@@ -23,8 +23,8 @@ func newReleaseServer(t *testing.T, body string, callCount *int64) *httptest.Ser
 const sampleReleaseJSON = `{
   "tag_name": "v2.328.0",
   "assets": [
-    {"name": "actions-runner-linux-arm64-2.328.0.tar.gz", "browser_download_url": "https://example/arm64.tgz"},
-    {"name": "actions-runner-linux-x64-2.328.0.tar.gz", "browser_download_url": "https://example/x64.tgz"},
+    {"name": "actions-runner-linux-arm64-2.328.0.tar.gz", "browser_download_url": "https://example/arm64.tgz", "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+    {"name": "actions-runner-linux-x64-2.328.0.tar.gz", "browser_download_url": "https://example/x64.tgz", "digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},
     {"name": "actions-runner-osx-x64-2.328.0.tar.gz", "browser_download_url": "https://example/macos.tgz"}
   ]
 }`
@@ -36,7 +36,7 @@ func TestResolver_PicksLinuxX64(t *testing.T) {
 	r := NewLatestResolver(0)
 	r.endpoint = srv.URL
 
-	rel, err := r.Resolve(t.Context())
+	rel, err := r.Resolve(t.Context(), "amd64")
 	if err != nil {
 		t.Fatalf("resolve: %v", err)
 	}
@@ -45,6 +45,9 @@ func TestResolver_PicksLinuxX64(t *testing.T) {
 	}
 	if rel.DownloadURL != "https://example/x64.tgz" {
 		t.Errorf("download_url: want x64.tgz, got %q", rel.DownloadURL)
+	}
+	if rel.SHA256 != strings.Repeat("b", 64) {
+		t.Errorf("sha256: got %q", rel.SHA256)
 	}
 }
 
@@ -57,7 +60,7 @@ func TestResolver_CachesWithinTTL(t *testing.T) {
 	r.endpoint = srv.URL
 
 	for i := 0; i < 5; i++ {
-		if _, err := r.Resolve(t.Context()); err != nil {
+		if _, err := r.Resolve(t.Context(), "amd64"); err != nil {
 			t.Fatalf("resolve %d: %v", i, err)
 		}
 	}
@@ -74,11 +77,11 @@ func TestResolver_RefetchesAfterTTL(t *testing.T) {
 	r := NewLatestResolver(time.Millisecond)
 	r.endpoint = srv.URL
 
-	if _, err := r.Resolve(t.Context()); err != nil {
+	if _, err := r.Resolve(t.Context(), "amd64"); err != nil {
 		t.Fatalf("first: %v", err)
 	}
 	time.Sleep(5 * time.Millisecond)
-	if _, err := r.Resolve(t.Context()); err != nil {
+	if _, err := r.Resolve(t.Context(), "amd64"); err != nil {
 		t.Fatalf("second: %v", err)
 	}
 	if got := atomic.LoadInt64(&hits); got != 2 {
@@ -87,14 +90,14 @@ func TestResolver_RefetchesAfterTTL(t *testing.T) {
 }
 
 func TestResolver_ErrorsWithoutLinuxX64Asset(t *testing.T) {
-	body := `{"tag_name":"v1.2.3","assets":[{"name":"actions-runner-linux-arm64-1.2.3.tar.gz","browser_download_url":"https://example/arm64.tgz"}]}`
+	body := `{"tag_name":"v1.2.3","assets":[{"name":"actions-runner-linux-arm64-1.2.3.tar.gz","browser_download_url":"https://example/arm64.tgz","digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]}`
 	srv := newReleaseServer(t, body, nil)
 	t.Cleanup(srv.Close)
 
 	r := NewLatestResolver(0)
 	r.endpoint = srv.URL
 
-	_, err := r.Resolve(t.Context())
+	_, err := r.Resolve(t.Context(), "amd64")
 	if err == nil || !strings.Contains(err.Error(), "no linux-x64 asset") {
 		t.Fatalf("want missing-asset error, got %v", err)
 	}
@@ -109,7 +112,7 @@ func TestResolver_ErrorsOnNon200(t *testing.T) {
 	r := NewLatestResolver(0)
 	r.endpoint = srv.URL
 
-	if _, err := r.Resolve(t.Context()); err == nil {
+	if _, err := r.Resolve(t.Context(), "amd64"); err == nil {
 		t.Fatal("want HTTP error")
 	}
 }
@@ -121,7 +124,68 @@ func TestResolver_ErrorsOnEmptyTag(t *testing.T) {
 	r := NewLatestResolver(0)
 	r.endpoint = srv.URL
 
-	if _, err := r.Resolve(t.Context()); err == nil {
+	if _, err := r.Resolve(t.Context(), "amd64"); err == nil {
 		t.Fatal("want missing-tag error")
+	}
+}
+
+func TestResolver_PicksLinuxARM64(t *testing.T) {
+	srv := newReleaseServer(t, sampleReleaseJSON, nil)
+	t.Cleanup(srv.Close)
+
+	r := NewLatestResolver(time.Hour)
+	r.endpoint = srv.URL
+
+	rel, err := r.Resolve(t.Context(), "arm64")
+	if err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	if rel.DownloadURL != "https://example/arm64.tgz" {
+		t.Fatalf("download_url: got %q", rel.DownloadURL)
+	}
+}
+
+func TestResolver_ZeroTTLDoesNotCache(t *testing.T) {
+	var hits int64
+	srv := newReleaseServer(t, sampleReleaseJSON, &hits)
+	t.Cleanup(srv.Close)
+
+	r := NewLatestResolver(0)
+	r.endpoint = srv.URL
+	for range 2 {
+		if _, err := r.Resolve(t.Context(), "amd64"); err != nil {
+			t.Fatalf("resolve: %v", err)
+		}
+	}
+	if got := atomic.LoadInt64(&hits); got != 2 {
+		t.Fatalf("network calls: got %d, want 2", got)
+	}
+}
+
+func TestResolver_UsesStaleReleaseWhenRefreshFails(t *testing.T) {
+	var fail atomic.Bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if fail.Load() {
+			http.Error(w, "unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		_, _ = w.Write([]byte(sampleReleaseJSON))
+	}))
+	t.Cleanup(srv.Close)
+
+	r := NewLatestResolver(time.Millisecond)
+	r.endpoint = srv.URL
+	first, err := r.Resolve(t.Context(), "amd64")
+	if err != nil {
+		t.Fatalf("first resolve: %v", err)
+	}
+	time.Sleep(5 * time.Millisecond)
+	fail.Store(true)
+	got, err := r.Resolve(t.Context(), "amd64")
+	if err != nil {
+		t.Fatalf("stale fallback: %v", err)
+	}
+	if got != first {
+		t.Fatalf("stale release: got %#v, want %#v", got, first)
 	}
 }

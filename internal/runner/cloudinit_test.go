@@ -16,6 +16,7 @@ func sampleSpec() CloudInitSpec {
 		Release: Release{
 			Version:     "2.328.0",
 			DownloadURL: "https://github.com/actions/runner/releases/download/v2.328.0/actions-runner-linux-x64-2.328.0.tar.gz",
+			SHA256:      "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
 		},
 		JITConfig:  "ZmFrZS1qaXQtY29uZmlnLWJsb2I=",
 		WorkFolder: "_work",
@@ -57,6 +58,7 @@ func TestRender_ValidationFailures(t *testing.T) {
 	}{
 		{"missing version", func(s *CloudInitSpec) { s.Release.Version = "" }, "version"},
 		{"missing download url", func(s *CloudInitSpec) { s.Release.DownloadURL = "" }, "download_url"},
+		{"missing sha256", func(s *CloudInitSpec) { s.Release.SHA256 = "" }, "sha256"},
 		{"missing jit", func(s *CloudInitSpec) { s.JITConfig = "" }, "jit_config"},
 		{"missing work folder", func(s *CloudInitSpec) { s.WorkFolder = "" }, "work_folder"},
 		{"missing runner name", func(s *CloudInitSpec) { s.RunnerName = "" }, "runner_name"},

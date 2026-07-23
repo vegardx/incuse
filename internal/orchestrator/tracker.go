@@ -21,7 +21,8 @@ import (
 type trackedRunner struct {
 	Name       string
 	RunnerID   int64 // GitHub-side runner registration id, for RemoveRunner cleanup
-	LaunchedAt time.Time
+	MintedAt   time.Time
+	ReadyAt    time.Time
 	BusyAt     time.Time // zero while idle/launching
 	Spec       config.RunnerSpec
 	ScaleSetID int
@@ -97,7 +98,7 @@ func (t *instanceTracker) markIdle(runnerName string, now time.Time) (terminatio
 	}
 	if v.State == statusLaunching {
 		v.State = statusIdle
-		v.LaunchedAt = now
+		v.ReadyAt = now
 	}
 	return v.TerminationPending, true
 }
