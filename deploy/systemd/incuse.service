@@ -8,18 +8,18 @@ Requires=incus.service
 [Service]
 Type=simple
 
-# Fixed user with `incus-admin` supplementary group: required for
+# Dedicated user with `incus-admin` supplementary group: required for
 # Unix-socket access to the Incus daemon. Rules out DynamicUser=yes —
 # the install script creates this user idempotently.
-User=incuse
-Group=incuse
+User=@INCUSE_USER@
+Group=@INCUSE_GROUP@
 SupplementaryGroups=incus-admin
 
 # Preflight runs Validate + Preflight (file existence + perm checks)
 # so the unit fails fast with a clear error if a credential or cert
 # is missing or world-readable.
-ExecStartPre=/usr/local/bin/incuse --validate --config /etc/incuse/config.yaml
-ExecStart=/usr/local/bin/incuse --config /etc/incuse/config.yaml
+ExecStartPre="@INCUSE_PREFIX@/bin/incuse" --validate --config "@INCUSE_CONFIG_DIR@/config.yaml"
+ExecStart="@INCUSE_PREFIX@/bin/incuse" --config "@INCUSE_CONFIG_DIR@/config.yaml"
 
 Restart=on-failure
 RestartSec=5s

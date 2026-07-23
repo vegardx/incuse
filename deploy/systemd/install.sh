@@ -32,6 +32,21 @@ if [[ ! -f "$BIN_SRC" ]]; then
 	exit 1
 fi
 
+if [[ "$PREFIX" != /* || "$CONFIG_DIR" != /* ]]; then
+	echo "install.sh: prefix and config directory must be absolute paths" >&2
+	exit 1
+fi
+if [[ ! "$PREFIX" =~ ^/[A-Za-z0-9_./-]+$ ]] ||
+	[[ ! "$CONFIG_DIR" =~ ^/[A-Za-z0-9_./-]+$ ]]; then
+	echo "install.sh: prefix and config directory contain invalid characters" >&2
+	exit 1
+fi
+if [[ ! "$SERVICE_USER" =~ ^[a-z_][a-z0-9_-]*$ ]] ||
+	[[ ! "$SERVICE_GROUP" =~ ^[a-z_][a-z0-9_-]*$ ]]; then
+	echo "install.sh: service user and group contain invalid characters" >&2
+	exit 1
+fi
+
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &> /dev/null && pwd)"
 unit_src="$script_dir/incuse.service"
 example_src="$script_dir/incuse.example.yaml"
@@ -73,7 +88,15 @@ fi
 install -d -m 0750 -o "$SERVICE_USER" -g "$SERVICE_GROUP" /var/lib/incuse
 
 # 5. Systemd unit.
-install -m 0644 "$unit_src" /etc/systemd/system/incuse.service
+unit_contents="$(<"$unit_src")"
+unit_contents="${unit_contents//@INCUSE_PREFIX@/$PREFIX}"
+unit_contents="${unit_contents//@INCUSE_CONFIG_DIR@/$CONFIG_DIR}"
+unit_contents="${unit_contents//@INCUSE_USER@/$SERVICE_USER}"
+unit_contents="${unit_contents//@INCUSE_GROUP@/$SERVICE_GROUP}"
+unit_tmp="$(mktemp)"
+trap 'rm -f "$unit_tmp"' EXIT
+printf '%s\n' "$unit_contents" > "$unit_tmp"
+install -m 0644 "$unit_tmp" /etc/systemd/system/incuse.service
 systemctl daemon-reload
 
 echo
