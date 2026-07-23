@@ -31,7 +31,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -89,7 +88,7 @@ type ScaleSetClient interface {
 // ReleaseResolver returns the current actions/runner release. Backed
 // by *runner.LatestResolver in production.
 type ReleaseResolver interface {
-	Resolve(ctx context.Context) (runner.Release, error)
+	Resolve(ctx context.Context, arch string) (runner.Release, error)
 }
 
 // CloudInitRenderer renders the per-launch #cloud-config payload.
@@ -103,10 +102,8 @@ type Config struct {
 	ReleaseResolver ReleaseResolver
 	IncusCfg        config.IncusConfig
 	RunnerCfg       config.RunnerConfig
-
-	// HostArch is runtime.GOARCH on the orchestrator process. Test
-	// override; defaults to runtime.GOARCH.
-	HostArch string
+	MintLimiter     *Limiter
+	LaunchLimiter   *Limiter
 
 	// Logger is required.
 	Logger *slog.Logger
@@ -126,15 +123,42 @@ type Config struct {
 	Metrics MetricsHook
 }
 
+// Limiter is a process-wide concurrency bound shared by every class.
+type Limiter struct {
+	sem chan struct{}
+}
+
+// NewLimiter returns a limiter with the given positive capacity.
+func NewLimiter(capacity int) *Limiter {
+	return &Limiter{sem: make(chan struct{}, capacity)}
+}
+
+func (l *Limiter) acquire(ctx context.Context) bool {
+	select {
+	case l.sem <- struct{}{}:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
+func (l *Limiter) release() {
+	<-l.sem
+}
+
 // Orchestrator is the long-lived process glue. Construct via New.
 type Orchestrator struct {
 	cfg     Config
 	tracker *instanceTracker
 
-	// spawnSem caps in-flight runner spawns. Buffer size = MaxRunners
-	// so a burst HandleDesiredRunnerCount call only blocks when we
-	// are at capacity.
-	spawnSem chan struct{}
+	mintLimiter   *Limiter
+	launchLimiter *Limiter
+
+	lifecycleCtx context.Context
+	cancel       context.CancelFunc
+	tasks        sync.WaitGroup
+	taskMu       sync.Mutex
+	shuttingDown bool
 
 	// spawnInflight counts runners we've decided to spawn but
 	// haven't yet added to the tracker. Prevents a fast-fire
@@ -169,17 +193,26 @@ func New(cfg Config) (*Orchestrator, error) {
 	if cfg.RunnerCfg.MaxJobDuration <= 0 {
 		return nil, errors.New("runner.max_job_duration must be positive")
 	}
-	if len(cfg.RunnerCfg.VCPUTiers) == 0 {
-		return nil, errors.New("runner.vcpu_tiers must have at least one tier")
+	if cfg.RunnerCfg.MaxParallelMints <= 0 {
+		return nil, errors.New("runner.max_parallel_mints must be positive")
 	}
-	max := cfg.ScaleSet.Spec().MaxRunners
+	if cfg.RunnerCfg.MaxParallelLaunches <= 0 {
+		return nil, errors.New("runner.max_parallel_launches must be positive")
+	}
+	spec := cfg.ScaleSet.Spec()
+	max := spec.MaxRunners
 	if max <= 0 {
 		return nil, errors.New("scale_set.max_runners must be positive")
 	}
-
-	if cfg.HostArch == "" {
-		cfg.HostArch = runtime.GOARCH
+	if spec.Runner.VCPUs <= 0 || spec.Runner.MemoryMB <= 0 ||
+		spec.Runner.DiskGB <= 0 {
+		return nil, errors.New("scale_set runner shape must be positive")
 	}
+	if spec.Runner.Arch != config.ArchAMD64 &&
+		spec.Runner.Arch != config.ArchARM64 {
+		return nil, errors.New("scale_set runner arch must be amd64 or arm64")
+	}
+
 	if cfg.ReapInterval == 0 {
 		cfg.ReapInterval = 30 * time.Second
 	}
@@ -192,11 +225,21 @@ func New(cfg Config) (*Orchestrator, error) {
 	if cfg.Metrics == nil {
 		cfg.Metrics = noopMetrics{}
 	}
+	if cfg.MintLimiter == nil {
+		cfg.MintLimiter = NewLimiter(cfg.RunnerCfg.MaxParallelMints)
+	}
+	if cfg.LaunchLimiter == nil {
+		cfg.LaunchLimiter = NewLimiter(cfg.RunnerCfg.MaxParallelLaunches)
+	}
 
+	lifecycleCtx, cancel := context.WithCancel(context.Background())
 	return &Orchestrator{
-		cfg:      cfg,
-		tracker:  newInstanceTracker(),
-		spawnSem: make(chan struct{}, max),
+		cfg:           cfg,
+		tracker:       newInstanceTracker(),
+		mintLimiter:   cfg.MintLimiter,
+		launchLimiter: cfg.LaunchLimiter,
+		lifecycleCtx:  lifecycleCtx,
+		cancel:        cancel,
 	}, nil
 }
 
@@ -206,6 +249,13 @@ func New(cfg Config) (*Orchestrator, error) {
 func (o *Orchestrator) Run(ctx context.Context) error {
 	t := time.NewTicker(o.cfg.ReapInterval)
 	defer t.Stop()
+	defer func() {
+		o.taskMu.Lock()
+		o.shuttingDown = true
+		o.cancel()
+		o.taskMu.Unlock()
+		o.tasks.Wait()
+	}()
 
 	o.cfg.Logger.Info("orchestrator running",
 		"reap_interval", o.cfg.ReapInterval,
@@ -229,7 +279,7 @@ func (o *Orchestrator) Run(ctx context.Context) error {
 // scale down idle runners — JobCompleted handles teardown of busy
 // ones, and idle runners that never get a job are caught by the
 // registration-timeout reaper.
-func (o *Orchestrator) HandleDesiredRunnerCount(ctx context.Context, count int) (int, error) {
+func (o *Orchestrator) HandleDesiredRunnerCount(_ context.Context, count int) (int, error) {
 	max := o.cfg.ScaleSet.Spec().MaxRunners
 	target := count
 	if target > max {
@@ -255,10 +305,28 @@ func (o *Orchestrator) HandleDesiredRunnerCount(ctx context.Context, count int) 
 	)
 
 	for i := 0; i < scaleUp; i++ {
-		o.spawnIdleRunner(ctx)
+		if !o.startSpawnTask() {
+			o.spawnMu.Lock()
+			o.spawnInflight--
+			o.spawnMu.Unlock()
+		}
 	}
 
 	return target, nil
+}
+
+func (o *Orchestrator) startSpawnTask() bool {
+	o.taskMu.Lock()
+	defer o.taskMu.Unlock()
+	if o.shuttingDown {
+		return false
+	}
+	o.tasks.Add(1)
+	go func() {
+		defer o.tasks.Done()
+		o.spawnIdleRunner()
+	}()
+	return true
 }
 
 // HandleJobStarted implements sslistener.Scaler. Marks the named
@@ -312,18 +380,32 @@ func (o *Orchestrator) HandleJobCompleted(ctx context.Context, event *ssapi.JobC
 // returns immediately so a burst HandleDesiredRunnerCount call
 // doesn't block on hypervisor work.
 //
-// Runners are minted at the smallest configured VCPU tier — at idle
-// mint time we don't know what labels a future JobAssigned will
-// carry, so we go conservative. Multi-tier support requires multiple
-// scale sets, matching upstream ARC's pattern.
-func (o *Orchestrator) spawnIdleRunner(ctx context.Context) {
-	defer func() {
+// Every runner uses the immutable shape owned by this scale set.
+func (o *Orchestrator) spawnIdleRunner() {
+	ctx := o.lifecycleCtx
+	inflight := true
+	finishInflight := func() {
+		if !inflight {
+			return
+		}
 		o.spawnMu.Lock()
 		o.spawnInflight--
 		o.spawnMu.Unlock()
+		inflight = false
+	}
+	defer finishInflight()
+
+	if !o.mintLimiter.acquire(ctx) {
+		return
+	}
+	mintHeld := true
+	defer func() {
+		if mintHeld {
+			o.mintLimiter.release()
+		}
 	}()
 
-	spec := defaultSpec(o.cfg.RunnerCfg, o.cfg.HostArch)
+	spec := o.cfg.ScaleSet.Spec().Runner
 
 	var release runner.Release
 	if !o.cfg.RunnerCfg.UseBakedImage {
@@ -331,7 +413,7 @@ func (o *Orchestrator) spawnIdleRunner(ctx context.Context) {
 		// Baked mode skips this — the version is whatever was baked
 		// into the image at scripts/build-runner-image.sh time.
 		var err error
-		release, err = o.cfg.ReleaseResolver.Resolve(ctx)
+		release, err = o.cfg.ReleaseResolver.Resolve(ctx, spec.Arch)
 		if err != nil {
 			o.cfg.Logger.Error("resolve runner release", "error", err)
 			return
@@ -374,12 +456,16 @@ func (o *Orchestrator) spawnIdleRunner(ctx context.Context) {
 	tracked := &trackedRunner{
 		Name:       runnerName,
 		RunnerID:   runnerRefID(ref),
-		LaunchedAt: mintedAt,
+		MintedAt:   mintedAt,
 		Spec:       spec,
 		ScaleSetID: o.cfg.ScaleSet.ScaleSetID(),
 		State:      statusLaunching,
 	}
+	o.spawnMu.Lock()
 	o.tracker.add(tracked)
+	o.spawnInflight--
+	inflight = false
+	o.spawnMu.Unlock()
 	o.cfg.Metrics.RunnerSpawned()
 	o.cfg.Metrics.SetTrackedInstances(o.tracker.size())
 
@@ -391,62 +477,61 @@ func (o *Orchestrator) spawnIdleRunner(ctx context.Context) {
 		"arch", spec.Arch,
 	)
 
-	o.dispatchLaunch(ctx, req, tracked)
+	o.mintLimiter.release()
+	mintHeld = false
+	o.launch(ctx, req, tracked)
 }
 
-// dispatchLaunch starts the Launch goroutine. Bounded by spawnSem so
-// a 100-runner burst doesn't fork-bomb Incus.
-func (o *Orchestrator) dispatchLaunch(ctx context.Context, req incus.LaunchRequest, tracked *trackedRunner) {
-	go func() {
-		select {
-		case o.spawnSem <- struct{}{}:
-		case <-ctx.Done():
-			o.tracker.remove(tracked.Name)
-			o.cfg.Metrics.SetTrackedInstances(o.tracker.size())
-			return
-		}
-		defer func() { <-o.spawnSem }()
+// launch performs one tracked Incus launch. The caller is an owned
+// lifecycle task and launchSem bounds concurrent hypervisor work.
+func (o *Orchestrator) launch(ctx context.Context, req incus.LaunchRequest, tracked *trackedRunner) {
+	if !o.launchLimiter.acquire(ctx) {
+		o.tracker.remove(tracked.Name)
+		o.cfg.Metrics.SetTrackedInstances(o.tracker.size())
+		o.removeRunnerByID(ctx, tracked.RunnerID, tracked.Name, "shutdown before launch")
+		return
+	}
+	defer o.launchLimiter.release()
 
-		if o.tracker.terminationPending(tracked.Name) {
-			o.cfg.Logger.Info("aborting launch; termination requested before create",
-				"runner_name", tracked.Name,
-			)
-			o.tracker.remove(tracked.Name)
-			o.cfg.Metrics.SetTrackedInstances(o.tracker.size())
-			o.removeRunnerByID(ctx, tracked.RunnerID, tracked.Name, "termination during launch")
-			return
-		}
-
-		start := o.cfg.Now()
-		inst, err := o.cfg.IncusClient.Launch(ctx, req)
-		o.cfg.Metrics.LaunchDuration(o.cfg.Now().Sub(start).Seconds())
-		if err != nil {
-			o.cfg.Metrics.LaunchFail()
-			o.cfg.Logger.Error("launch failed",
-				"runner_name", tracked.Name,
-				"error", err,
-			)
-			o.tracker.remove(tracked.Name)
-			o.cfg.Metrics.SetTrackedInstances(o.tracker.size())
-			o.removeRunnerByID(ctx, tracked.RunnerID, tracked.Name, "launch failed")
-			return
-		}
-
-		o.cfg.Metrics.LaunchOK()
-		terminationRequested, _ := o.tracker.markIdle(tracked.Name, o.cfg.Now())
-		if terminationRequested {
-			o.cfg.Logger.Info("launch ok but termination requested mid-flight; tearing down",
-				"runner_name", tracked.Name,
-			)
-			o.terminateInstance(ctx, tracked.Name, "deferred from launching")
-			o.removeRunnerByID(ctx, tracked.RunnerID, tracked.Name, "termination during launch")
-			return
-		}
-		o.cfg.Logger.Info("launch ok",
+	if o.tracker.terminationPending(tracked.Name) {
+		o.cfg.Logger.Info("aborting launch; termination requested before create",
 			"runner_name", tracked.Name,
-			"status", inst.Status,
 		)
-	}()
+		o.tracker.remove(tracked.Name)
+		o.cfg.Metrics.SetTrackedInstances(o.tracker.size())
+		o.removeRunnerByID(ctx, tracked.RunnerID, tracked.Name, "termination during launch")
+		return
+	}
+
+	start := o.cfg.Now()
+	inst, err := o.cfg.IncusClient.Launch(ctx, req)
+	o.cfg.Metrics.LaunchDuration(o.cfg.Now().Sub(start).Seconds())
+	if err != nil {
+		o.cfg.Metrics.LaunchFail()
+		o.cfg.Logger.Error("launch failed",
+			"runner_name", tracked.Name,
+			"error", err,
+		)
+		o.tracker.remove(tracked.Name)
+		o.cfg.Metrics.SetTrackedInstances(o.tracker.size())
+		o.removeRunnerByID(ctx, tracked.RunnerID, tracked.Name, "launch failed")
+		return
+	}
+
+	o.cfg.Metrics.LaunchOK()
+	terminationRequested, _ := o.tracker.markIdle(tracked.Name, o.cfg.Now())
+	if terminationRequested {
+		o.cfg.Logger.Info("launch ok but termination requested mid-flight; tearing down",
+			"runner_name", tracked.Name,
+		)
+		o.terminateInstance(ctx, tracked.Name, "deferred from launching")
+		o.removeRunnerByID(ctx, tracked.RunnerID, tracked.Name, "termination during launch")
+		return
+	}
+	o.cfg.Logger.Info("launch ok",
+		"runner_name", tracked.Name,
+		"status", inst.Status,
+	)
 }
 
 // terminateInstance stops + deletes a managed instance and removes
@@ -461,7 +546,7 @@ func (o *Orchestrator) terminateInstance(ctx context.Context, runnerName, reason
 		return
 	}
 	if r, ok := o.tracker.get(runnerName); ok {
-		o.cfg.Metrics.RunnerLifetime(o.cfg.Now().Sub(r.LaunchedAt).Seconds())
+		o.cfg.Metrics.RunnerLifetime(o.cfg.Now().Sub(r.MintedAt).Seconds())
 	}
 	o.tracker.remove(runnerName)
 	o.cfg.Metrics.SetTrackedInstances(o.tracker.size())
@@ -495,6 +580,11 @@ func (o *Orchestrator) removeRunnerByID(ctx context.Context, runnerID int64, run
 	if runnerID == 0 {
 		return
 	}
+	if ctx.Err() != nil {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+	}
 	if err := o.cfg.ScaleSet.RemoveRunner(ctx, runnerID); err != nil {
 		o.cfg.Logger.Warn("remove runner from github failed",
 			"runner_name", runnerName,
@@ -505,33 +595,39 @@ func (o *Orchestrator) removeRunnerByID(ctx context.Context, runnerID int64, run
 	}
 }
 
-// defaultSpec returns the smallest-tier runner shape for new idle
-// runners. The HostArch defaults to the orchestrator's runtime.GOARCH;
-// future multi-arch support would parse a label-driven spec, but for
-// MVP we mint at a single shape.
-func defaultSpec(rc config.RunnerConfig, hostArch string) config.RunnerSpec {
-	tier := rc.VCPUTiers[0]
-	for _, t := range rc.VCPUTiers {
-		if t < tier {
-			tier = t
+// makeRunnerName returns a valid Incus name while preserving the
+// collision-resistant suffix when truncation is necessary.
+func makeRunnerName(scaleSet, suffix string) string {
+	scaleSet = sanitizeNamePart(scaleSet)
+	suffix = sanitizeNamePart(suffix)
+	name := strings.Trim(scaleSet+"-"+suffix, "-")
+	if len(name) > 63 {
+		prefixLen := 63 - len(suffix) - 1
+		if prefixLen < 1 {
+			name = suffix[len(suffix)-63:]
+		} else {
+			name = strings.TrimRight(scaleSet[:prefixLen], "-") + "-" + suffix
 		}
 	}
-	return config.RunnerSpec{
-		VCPUs:    tier,
-		MemoryMB: tier * rc.MemoryPerVCPUMiB,
-		DiskGB:   rc.RootDiskGiB,
-		Arch:     hostArch,
-	}
+	return name
 }
 
-// makeRunnerName returns "<scaleset>-<suffix>", lowercased and
-// truncated to 63 chars (Incus instance name limit).
-func makeRunnerName(scaleSet, suffix string) string {
-	name := strings.ToLower(scaleSet + "-" + suffix)
-	if len(name) > 63 {
-		name = name[:63]
+func sanitizeNamePart(value string) string {
+	value = strings.ToLower(value)
+	var b strings.Builder
+	b.Grow(len(value))
+	lastDash := false
+	for _, r := range value {
+		valid := r >= 'a' && r <= 'z' || r >= '0' && r <= '9'
+		if valid {
+			b.WriteRune(r)
+			lastDash = false
+		} else if !lastDash {
+			b.WriteByte('-')
+			lastDash = true
+		}
 	}
-	return name
+	return strings.Trim(b.String(), "-")
 }
 
 func randomNameSuffix() string {

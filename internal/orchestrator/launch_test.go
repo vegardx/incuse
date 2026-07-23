@@ -11,8 +11,12 @@ import (
 func baseInputs() launchInputs {
 	return launchInputs{
 		runnerName: "incuse-test-abc",
-		spec:       config.RunnerSpec{VCPUs: 2, MemoryMB: 8192, DiskGB: 40},
-		incusCfg:   config.IncusConfig{Project: "incuse", DefaultProfile: "incuse-runner"},
+		spec: config.RunnerSpec{
+			VCPUs: 2, MemoryMB: 8192, DiskGB: 40, Arch: config.ArchAMD64,
+		},
+		incusCfg: config.IncusConfig{
+			Project: "incuse", DefaultProfile: "incuse-runner", StoragePool: "fast",
+		},
 		runnerCfg: config.RunnerConfig{
 			ImageAlias: "ubuntu/24.04/cloud",
 		},
@@ -28,6 +32,12 @@ func TestBuildLaunchRequest_VMDefault(t *testing.T) {
 
 	if req.Type != incus.InstanceTypeVM {
 		t.Fatalf("Type = %q, want %q", req.Type, incus.InstanceTypeVM)
+	}
+	if req.Architecture != config.ArchAMD64 {
+		t.Errorf("Architecture = %q, want amd64", req.Architecture)
+	}
+	if got := req.Devices["root"]["pool"]; got != "fast" {
+		t.Errorf("root pool = %q, want fast", got)
 	}
 	for _, k := range []string{"security.nesting", "security.privileged", "security.syscalls.intercept.mknod"} {
 		if _, ok := req.Config[k]; ok {

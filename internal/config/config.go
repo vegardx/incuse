@@ -1,11 +1,10 @@
 // Package config carries the on-disk YAML schema, Load+validate plumbing,
-// and the label-resolver that maps a GitHub job's RequestLabels onto a
-// concrete RunnerSpec (vcpu count, arch, memory, disk).
+// and expansion of configured runner classes into scale-set specifications.
 //
 // Schema lives in /etc/incuse/config.yaml on a deployed host. Defaults
 // match the plan's MVP target — Unix-socket Incus access, ubuntu/24.04
-// VMs, the runner-group named "Default" — so a minimal config only has
-// to set github.config_url, github.auth, and scale_set.name.
+// VMs and the runner-group named "Default". A minimal config supplies
+// GitHub auth, runner classes, and the explicit Incus storage pool.
 package config
 
 import (
@@ -13,6 +12,7 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"regexp"
 	"strings"
 	"time"
 
@@ -22,7 +22,7 @@ import (
 // Config is the top-level schema. Loaded with Load.
 type Config struct {
 	GitHub        GitHubConfig        `yaml:"github"`
-	ScaleSet      ScaleSetConfig      `yaml:"scale_set"`
+	ScaleSets     ScaleSetsConfig     `yaml:"scale_sets"`
 	Incus         IncusConfig         `yaml:"incus"`
 	Runner        RunnerConfig        `yaml:"runner"`
 	Observability ObservabilityConfig `yaml:"observability"`
@@ -54,43 +54,60 @@ type AppCredentials struct {
 	InstallationID int64  `yaml:"installation_id"`
 }
 
-// ScaleSetConfig describes the single GitHub Runner Scale Set incuse
-// owns. Labels are reconciled at bootstrap from BaseLabels +
-// ValidRunnerLabels(VCPUTiers).
+// ScaleSetsConfig describes the homogeneous runner classes incuse owns.
+// Each class becomes a distinct GitHub Runner Scale Set.
+type ScaleSetsConfig struct {
+	Prefix      string              `yaml:"prefix"`
+	RunnerGroup string              `yaml:"runner_group"`
+	BaseLabels  []string            `yaml:"base_labels"`
+	Classes     []RunnerClassConfig `yaml:"classes"`
+}
+
+// RunnerClassConfig is one fixed runner shape and its independent capacity.
+type RunnerClassConfig struct {
+	VCPUs      int    `yaml:"vcpus"`
+	MemoryGiB  int    `yaml:"memory_gib"`
+	DiskGiB    int    `yaml:"disk_gib"`
+	Arch       string `yaml:"arch"`
+	MaxRunners int    `yaml:"max_runners"`
+}
+
+// ScaleSetConfig is the derived runtime specification for one class.
 type ScaleSetConfig struct {
 	Name        string   `yaml:"name"`
 	RunnerGroup string   `yaml:"runner_group"`
 	BaseLabels  []string `yaml:"base_labels"`
 	MaxRunners  int      `yaml:"max_runners"`
+	Runner      RunnerSpec
 }
 
 // IncusConfig is the input to internal/incus.Connect. URL and
 // SocketPath are mutually exclusive — empty URL selects Unix socket.
 type IncusConfig struct {
-	URL                string `yaml:"url"`
-	SocketPath         string `yaml:"socket_path"`
-	CertFile           string `yaml:"cert_file"`
-	KeyFile            string `yaml:"key_file"`
-	ServerCertFile     string `yaml:"server_cert_file"`
-	InsecureSkipVerify bool   `yaml:"insecure_skip_verify"`
-	Project            string `yaml:"project"`
-	DefaultProfile     string `yaml:"default_profile"`
+	URL                string        `yaml:"url"`
+	SocketPath         string        `yaml:"socket_path"`
+	CertFile           string        `yaml:"cert_file"`
+	KeyFile            string        `yaml:"key_file"`
+	ServerCertFile     string        `yaml:"server_cert_file"`
+	InsecureSkipVerify bool          `yaml:"insecure_skip_verify"`
+	Project            string        `yaml:"project"`
+	DefaultProfile     string        `yaml:"default_profile"`
+	StoragePool        string        `yaml:"storage_pool"`
+	RequestTimeout     time.Duration `yaml:"request_timeout"`
 }
 
 // RunnerConfig describes the per-instance VM shape and the
 // actions/runner tarball the cloud-init template installs.
 type RunnerConfig struct {
-	ImageServer         string        `yaml:"image_server"`
-	ImageProtocol       string        `yaml:"image_protocol"`
-	ImageAlias          string        `yaml:"image_alias"`
-	RunnerVersion       string        `yaml:"runner_version"`
-	RunnerSHA256        string        `yaml:"runner_sha256"`
-	WorkFolder          string        `yaml:"work_folder"`
-	VCPUTiers           []int         `yaml:"vcpu_tiers"`
-	MemoryPerVCPUMiB    int           `yaml:"memory_per_vcpu_mib"`
-	RootDiskGiB         int           `yaml:"root_disk_gib"`
-	RegistrationTimeout time.Duration `yaml:"registration_timeout"`
-	MaxJobDuration      time.Duration `yaml:"max_job_duration"`
+	ImageServer         string         `yaml:"image_server"`
+	ImageProtocol       string         `yaml:"image_protocol"`
+	ImageAlias          string         `yaml:"image_alias"`
+	WorkFolder          string         `yaml:"work_folder"`
+	RegistrationTimeout time.Duration  `yaml:"registration_timeout"`
+	MaxJobDuration      time.Duration  `yaml:"max_job_duration"`
+	ReleaseCacheTTL     *time.Duration `yaml:"release_cache_ttl"`
+	MaxParallelMints    int            `yaml:"max_parallel_mints"`
+	MaxParallelLaunches int            `yaml:"max_parallel_launches"`
 
 	// InstanceType selects between Incus virtual-machine (default,
 	// hypervisor-isolated, ~30s cold-boot) and system container
@@ -164,8 +181,11 @@ func Parse(raw []byte) (*Config, error) {
 }
 
 func (c *Config) applyDefaults() {
-	if c.ScaleSet.RunnerGroup == "" {
-		c.ScaleSet.RunnerGroup = "Default"
+	if c.ScaleSets.Prefix == "" {
+		c.ScaleSets.Prefix = "incuse"
+	}
+	if c.ScaleSets.RunnerGroup == "" {
+		c.ScaleSets.RunnerGroup = "Default"
 	}
 	if c.Incus.SocketPath == "" && c.Incus.URL == "" {
 		c.Incus.SocketPath = "/var/lib/incus/unix.socket"
@@ -175,6 +195,9 @@ func (c *Config) applyDefaults() {
 	}
 	if c.Incus.DefaultProfile == "" {
 		c.Incus.DefaultProfile = "incuse-runner"
+	}
+	if c.Incus.RequestTimeout == 0 {
+		c.Incus.RequestTimeout = 10 * time.Minute
 	}
 	if c.Runner.UseBakedImage {
 		// Baked-image flow: alias resolves locally on the Incus daemon.
@@ -197,20 +220,21 @@ func (c *Config) applyDefaults() {
 	if c.Runner.WorkFolder == "" {
 		c.Runner.WorkFolder = "_work"
 	}
-	if len(c.Runner.VCPUTiers) == 0 {
-		c.Runner.VCPUTiers = []int{1, 2, 4}
-	}
-	if c.Runner.MemoryPerVCPUMiB == 0 {
-		c.Runner.MemoryPerVCPUMiB = 4096
-	}
-	if c.Runner.RootDiskGiB == 0 {
-		c.Runner.RootDiskGiB = 40
-	}
 	if c.Runner.RegistrationTimeout == 0 {
 		c.Runner.RegistrationTimeout = 10 * time.Minute
 	}
 	if c.Runner.MaxJobDuration == 0 {
 		c.Runner.MaxJobDuration = 6 * time.Hour
+	}
+	if c.Runner.ReleaseCacheTTL == nil {
+		ttl := time.Hour
+		c.Runner.ReleaseCacheTTL = &ttl
+	}
+	if c.Runner.MaxParallelMints == 0 {
+		c.Runner.MaxParallelMints = 4
+	}
+	if c.Runner.MaxParallelLaunches == 0 {
+		c.Runner.MaxParallelLaunches = 2
 	}
 	if c.Runner.InstanceType == "" {
 		c.Runner.InstanceType = InstanceTypeVM
@@ -247,25 +271,55 @@ func (c *Config) Validate() error {
 		errs = append(errs, fmt.Sprintf("github.auth.mode %q must be pat or app", c.GitHub.Auth.Mode))
 	}
 
-	check(c.ScaleSet.Name != "", "scale_set.name is required")
-	check(c.ScaleSet.MaxRunners > 0, "scale_set.max_runners must be > 0")
+	check(validNamePrefix(c.ScaleSets.Prefix),
+		"scale_sets.prefix must contain lowercase letters, numbers, and dashes, start with a letter, and not end with a dash")
+	check(len(c.ScaleSets.Classes) > 0,
+		"scale_sets.classes must contain at least one runner class")
+	seenClasses := make(map[string]struct{}, len(c.ScaleSets.Classes))
+	bakedArch := ""
+	for i, class := range c.ScaleSets.Classes {
+		check(class.VCPUs > 0,
+			fmt.Sprintf("scale_sets.classes[%d].vcpus must be > 0", i))
+		check(class.MemoryGiB > 0,
+			fmt.Sprintf("scale_sets.classes[%d].memory_gib must be > 0", i))
+		check(class.DiskGiB > 0,
+			fmt.Sprintf("scale_sets.classes[%d].disk_gib must be > 0", i))
+		check(class.MaxRunners > 0,
+			fmt.Sprintf("scale_sets.classes[%d].max_runners must be > 0", i))
+		check(class.Arch == ArchAMD64 || class.Arch == ArchARM64,
+			fmt.Sprintf("scale_sets.classes[%d].arch must be amd64 or arm64", i))
+		name := class.ScaleSetName(c.ScaleSets.Prefix)
+		check(len(name) <= maxScaleSetNameLen,
+			fmt.Sprintf("scale_sets.classes[%d] generates name %q longer than %d characters", i, name, maxScaleSetNameLen))
+		if _, exists := seenClasses[name]; exists {
+			errs = append(errs, fmt.Sprintf(
+				"scale_sets.classes[%d] duplicates runner class %q", i, name))
+		}
+		seenClasses[name] = struct{}{}
+		if c.Runner.UseBakedImage {
+			if bakedArch == "" {
+				bakedArch = class.Arch
+			}
+			check(class.Arch == bakedArch,
+				"runner.use_baked_image requires every class to use one architecture because image_alias resolves to one local image")
+		}
+	}
 
 	if c.Incus.URL != "" {
 		check(c.Incus.CertFile != "", "incus.cert_file is required when incus.url is set")
 		check(c.Incus.KeyFile != "", "incus.key_file is required when incus.url is set")
 	}
+	check(c.Incus.StoragePool != "", "incus.storage_pool is required")
+	check(c.Incus.RequestTimeout > 0, "incus.request_timeout must be > 0")
 
-	check(len(c.Runner.VCPUTiers) > 0, "runner.vcpu_tiers must contain at least one tier")
-	for i, n := range c.Runner.VCPUTiers {
-		if n <= 0 {
-			errs = append(errs, fmt.Sprintf("runner.vcpu_tiers[%d] (%d) must be > 0", i, n))
-		}
-	}
-	check(c.Runner.MemoryPerVCPUMiB > 0, "runner.memory_per_vcpu_mib must be > 0")
-	check(c.Runner.RootDiskGiB > 0, "runner.root_disk_gib must be > 0")
-	check(c.Runner.RunnerVersion != "", "runner.runner_version is required (pin the actions/runner release)")
+	check(validWorkFolder(c.Runner.WorkFolder),
+		"runner.work_folder must be a relative path containing letters, numbers, dots, dashes, underscores, or slashes")
 	check(c.Runner.RegistrationTimeout > 0, "runner.registration_timeout must be > 0")
 	check(c.Runner.MaxJobDuration > 0, "runner.max_job_duration must be > 0")
+	check(c.Runner.ReleaseCacheTTL != nil && *c.Runner.ReleaseCacheTTL >= 0,
+		"runner.release_cache_ttl must be >= 0")
+	check(c.Runner.MaxParallelMints > 0, "runner.max_parallel_mints must be > 0")
+	check(c.Runner.MaxParallelLaunches > 0, "runner.max_parallel_launches must be > 0")
 
 	switch c.Runner.InstanceType {
 	case InstanceTypeVM, InstanceTypeContainer:
@@ -280,4 +334,36 @@ func (c *Config) Validate() error {
 		return errors.New("config invalid:\n  - " + strings.Join(errs, "\n  - "))
 	}
 	return nil
+}
+
+const maxScaleSetNameLen = 54
+
+var (
+	namePrefixPattern = regexp.MustCompile(`^[a-z][a-z0-9-]*[a-z0-9]$|^[a-z]$`)
+	workFolderPattern = regexp.MustCompile(`^[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)*$`)
+)
+
+func validNamePrefix(s string) bool {
+	return namePrefixPattern.MatchString(s)
+}
+
+func validWorkFolder(s string) bool {
+	return s != "" && !strings.HasPrefix(s, "/") &&
+		!strings.Contains(s, "..") && workFolderPattern.MatchString(s)
+}
+
+// ScaleSetSpecs expands the declarative runner classes into runtime scale sets.
+func (c *Config) ScaleSetSpecs() []ScaleSetConfig {
+	out := make([]ScaleSetConfig, 0, len(c.ScaleSets.Classes))
+	for _, class := range c.ScaleSets.Classes {
+		name := class.ScaleSetName(c.ScaleSets.Prefix)
+		out = append(out, ScaleSetConfig{
+			Name:        name,
+			RunnerGroup: c.ScaleSets.RunnerGroup,
+			BaseLabels:  ScaleSetLabels(c.ScaleSets.BaseLabels, name),
+			MaxRunners:  class.MaxRunners,
+			Runner:      class.RunnerSpec(),
+		})
+	}
+	return out
 }

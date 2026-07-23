@@ -15,18 +15,23 @@ github:
   auth:
     mode: pat
     pat_file: /etc/incuse/github.pat
-scale_set:
-  name: incuse
+scale_sets:
+  prefix: incuse
   runner_group: Default
-  base_labels: ["incuse"]
-  max_runners: 4
+  base_labels: ["self-hosted", "linux"]
+  classes:
+    - vcpus: 4
+      memory_gib: 8
+      disk_gib: 20
+      arch: amd64
+      max_runners: 4
 incus:
   socket_path: /var/lib/incus/unix.socket
   project: incuse
   default_profile: incuse-runner
+  storage_pool: runners
 runner:
-  runner_version: 2.328.0
-  vcpu_tiers: [1, 2, 4]
+  release_cache_ttl: 1h
 `
 }
 
@@ -36,8 +41,8 @@ func TestParse_AppliesDefaults(t *testing.T) {
 		t.Fatalf("parse: %v", err)
 	}
 
-	if cfg.ScaleSet.RunnerGroup != "Default" {
-		t.Errorf("runner group default: got %q", cfg.ScaleSet.RunnerGroup)
+	if cfg.ScaleSets.RunnerGroup != "Default" {
+		t.Errorf("runner group default: got %q", cfg.ScaleSets.RunnerGroup)
 	}
 	if cfg.Incus.Project != "incuse" {
 		t.Errorf("incus project default: got %q", cfg.Incus.Project)
@@ -45,8 +50,11 @@ func TestParse_AppliesDefaults(t *testing.T) {
 	if cfg.Runner.ImageAlias != "ubuntu/24.04/cloud" {
 		t.Errorf("image alias default: got %q", cfg.Runner.ImageAlias)
 	}
-	if cfg.Runner.MemoryPerVCPUMiB != 4096 {
-		t.Errorf("memory default: got %d", cfg.Runner.MemoryPerVCPUMiB)
+	if cfg.Incus.StoragePool != "runners" {
+		t.Errorf("storage pool: got %q", cfg.Incus.StoragePool)
+	}
+	if cfg.Runner.MaxParallelMints != 4 {
+		t.Errorf("mint concurrency default: got %d", cfg.Runner.MaxParallelMints)
 	}
 	if cfg.Runner.RegistrationTimeout != 10*time.Minute {
 		t.Errorf("registration timeout default: got %v", cfg.Runner.RegistrationTimeout)
@@ -54,8 +62,26 @@ func TestParse_AppliesDefaults(t *testing.T) {
 	if cfg.Runner.MaxJobDuration != 6*time.Hour {
 		t.Errorf("max job duration default: got %v", cfg.Runner.MaxJobDuration)
 	}
+	if cfg.Runner.ReleaseCacheTTL == nil ||
+		*cfg.Runner.ReleaseCacheTTL != time.Hour {
+		t.Errorf("release cache ttl: got %v", cfg.Runner.ReleaseCacheTTL)
+	}
 	if cfg.Runner.InstanceType != InstanceTypeVM {
 		t.Errorf("instance_type default: got %q, want %q", cfg.Runner.InstanceType, InstanceTypeVM)
+	}
+}
+
+func TestParse_PreservesExplicitZeroReleaseCacheTTL(t *testing.T) {
+	raw := strings.Replace(validYAML(),
+		"release_cache_ttl: 1h", "release_cache_ttl: 0s", 1)
+	cfg, err := Parse([]byte(raw))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if cfg.Runner.ReleaseCacheTTL == nil ||
+		*cfg.Runner.ReleaseCacheTTL != 0 {
+		t.Fatalf("release cache ttl: got %v, want explicit zero",
+			cfg.Runner.ReleaseCacheTTL)
 	}
 }
 
@@ -150,7 +176,7 @@ func TestValidate_RequiresAuthConfig(t *testing.T) {
 		{
 			"max_runners zero",
 			strings.Replace(validYAML(), "max_runners: 4", "max_runners: 0", 1),
-			"scale_set.max_runners must be > 0",
+			"scale_sets.classes[0].max_runners must be > 0",
 		},
 		{
 			"https without cert",
@@ -158,6 +184,11 @@ func TestValidate_RequiresAuthConfig(t *testing.T) {
 				"socket_path: /var/lib/incus/unix.socket",
 				"url: https://incus.example.com:8443", 1),
 			"incus.cert_file is required when incus.url is set",
+		},
+		{
+			"missing storage pool",
+			strings.Replace(validYAML(), "storage_pool: runners", "storage_pool: \"\"", 1),
+			"incus.storage_pool is required",
 		},
 	}
 	for _, tc := range cases {
@@ -183,7 +214,45 @@ func TestLoad_FromDisk(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load: %v", err)
 	}
-	if cfg.ScaleSet.Name != "incuse" {
-		t.Fatalf("name: got %q", cfg.ScaleSet.Name)
+	specs := cfg.ScaleSetSpecs()
+	if len(specs) != 1 || specs[0].Name != "incuse-4vcpu-8gb-20gb-amd64" {
+		t.Fatalf("specs: got %#v", specs)
+	}
+}
+
+func TestExampleConfigParses(t *testing.T) {
+	raw, err := os.ReadFile("../../deploy/systemd/incuse.example.yaml")
+	if err != nil {
+		t.Fatalf("read example: %v", err)
+	}
+	if _, err := Parse(raw); err != nil {
+		t.Fatalf("parse example: %v", err)
+	}
+}
+
+func TestScaleSetSpecs_OneHomogeneousSetPerClass(t *testing.T) {
+	cfg, err := Parse([]byte(strings.Replace(validYAML(),
+		"      max_runners: 4",
+		`      max_runners: 4
+    - vcpus: 8
+      memory_gib: 16
+      disk_gib: 80
+      arch: arm64
+      max_runners: 2`, 1)))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	specs := cfg.ScaleSetSpecs()
+	if len(specs) != 2 {
+		t.Fatalf("spec count: got %d, want 2", len(specs))
+	}
+	if got, want := specs[1].Name,
+		"incuse-8vcpu-16gb-80gb-arm64"; got != want {
+		t.Fatalf("second name: got %q, want %q", got, want)
+	}
+	if got := specs[1].Runner; got != (RunnerSpec{
+		VCPUs: 8, MemoryMB: 16 * 1024, DiskGB: 80, Arch: ArchARM64,
+	}) {
+		t.Fatalf("second shape: got %#v", got)
 	}
 }

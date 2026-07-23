@@ -15,7 +15,14 @@ amd64 only for the MVP — that's the hardware in production.
 
 ## Runner version
 
-incuse always tracks the latest published GitHub Actions runner. At startup (and on a 1-hour ticker) the orchestrator hits `GET https://api.github.com/repos/actions/runner/releases/latest`, picks the linux-x64 asset, and stuffs the resulting download URL into the cloud-init template.
+In vanilla-image mode, incuse tracks the latest published GitHub Actions
+runner. The first runner spawn fetches
+`GET https://api.github.com/repos/actions/runner/releases/latest`; later
+spawns refresh the release after `runner.release_cache_ttl` expires. The
+orchestrator selects the Linux asset for the class architecture, verifies
+GitHub's published SHA-256 digest, and places its download URL in cloud-init.
+The JIT token is only for registering the ephemeral runner and is not needed
+to download the public runner package.
 
 Trade-offs:
 - ✅ Zero per-launch API calls — a 100-runner burst hits the GitHub API once.
@@ -60,8 +67,8 @@ Setting `runner.privileged: true` (only valid alongside `instance_type: containe
 incuse is single-scale-set per process. To offer both VM and container runners on the same host, run two systemd units pointing at two configs:
 
 ```
-/etc/systemd/system/incuse-vm.service        → /etc/incuse/vm.yaml      (instance_type: vm,        scale_set.name: incuse-rocket-vm)
-/etc/systemd/system/incuse-container.service → /etc/incuse/container.yaml (instance_type: container, scale_set.name: incuse-rocket-container)
+/etc/systemd/system/incuse-vm.service        → /etc/incuse/vm.yaml
+/etc/systemd/system/incuse-container.service → /etc/incuse/container.yaml
 ```
 
 Workflows pick by label:
@@ -168,12 +175,15 @@ TOOLCACHE_NODE_VERSIONS="22.11.0 24.0.0" \
 Layout matches what `actions/setup-{node,python,go}` expects:
 
 ```
-/opt/hostedtoolcache/node/<ver>/x64/
-/opt/hostedtoolcache/Python/<ver>/x64/
-/opt/hostedtoolcache/go/<ver>/x64/
+/opt/hostedtoolcache/node/<ver>/<x64|arm64>/
+/opt/hostedtoolcache/Python/<ver>/<x64|arm64>/
+/opt/hostedtoolcache/go/<ver>/<x64|arm64>/
 ```
 
-With a `<ver>/x64.complete` sentinel file alongside each tree so the setup actions skip download. The runner unit sets `Environment=AGENT_TOOLSDIRECTORY=/opt/hostedtoolcache` so the actions find it.
+With a matching `<ver>/<arch>.complete` sentinel file alongside each tree so
+the setup actions skip download. `RUNNER_ARCH` defaults from the build host and
+accepts `amd64` or `arm64`. The runner unit sets
+`Environment=AGENT_TOOLSDIRECTORY=/opt/hostedtoolcache` so the actions find it.
 
 Re-run with a new `RUNNER_VERSION` whenever actions/runner releases a new version. The `--reuse` flag on `incus publish` makes re-runs idempotent.
 
@@ -185,8 +195,6 @@ In `/etc/incuse/config.yaml`:
 runner:
   image_alias: incuse-runner       # the floating alias from the build script
   use_baked_image: true            # tells incuse to use the minimal cloud-init template
-  runner_version: 2.334.0          # informational; baked into the image
-  runner_sha256: 048024cd2c848eb6f14d5646d56c13a4def2ae7ee3ad12122bee960c56f3d271
 ```
 
 Leave `image_server` / `image_protocol` unset (or empty). incuse looks up the alias on the local Incus daemon, not from a remote simplestreams server.
@@ -208,4 +216,3 @@ incuse picks up the new image on its next runner spawn. Already-running VMs are 
 - **Pro**: ~60-70s faster pickup. P50 drops from ~95s to ~25-35s on a 1-vCPU VM.
 - **Con**: image is now your responsibility — stale base-image security updates land later.
 - **Con**: harder to debug "vanilla works but baked doesn't" — try `use_baked_image: false` to force the heavyweight path if a job is failing weirdly.
-

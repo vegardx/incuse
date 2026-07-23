@@ -75,7 +75,7 @@ func buildLaunchRequest(in launchInputs) incus.LaunchRequest {
 		"root": {
 			"type": "disk",
 			"path": "/",
-			"pool": "default",
+			"pool": in.incusCfg.StoragePool,
 			"size": fmt.Sprintf("%dGiB", in.spec.DiskGB),
 		},
 	}
@@ -93,13 +93,14 @@ func buildLaunchRequest(in launchInputs) incus.LaunchRequest {
 	}
 
 	return incus.LaunchRequest{
-		Name:        in.runnerName,
-		Type:        instanceType,
-		Profiles:    []string{in.incusCfg.DefaultProfile},
-		Image:       incus.ImageSource{Server: imageServer, Protocol: imageProtocol, Alias: in.runnerCfg.ImageAlias},
-		Config:      cfgMap,
-		Devices:     devices,
-		Ephemeral:   true,
-		Description: in.description,
+		Name:         in.runnerName,
+		Architecture: in.spec.Arch,
+		Type:         instanceType,
+		Profiles:     []string{in.incusCfg.DefaultProfile},
+		Image:        incus.ImageSource{Server: imageServer, Protocol: imageProtocol, Alias: in.runnerCfg.ImageAlias},
+		Config:       cfgMap,
+		Devices:      devices,
+		Ephemeral:    true,
+		Description:  in.description,
 	}
 }

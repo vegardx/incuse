@@ -67,6 +67,8 @@ func (s CloudInitSpec) Validate() error {
 		return errors.New("release version is required")
 	case s.Release.DownloadURL == "":
 		return errors.New("release download_url is required")
+	case s.Release.SHA256 == "":
+		return errors.New("release sha256 is required")
 	case s.WorkFolder == "":
 		return errors.New("work_folder is required")
 	}
@@ -163,6 +165,7 @@ write_files:
 runcmd:
   - install -d -o runner -g runner -m 0755 /opt/runner /opt/runner/{{.WorkFolder}}
   - curl -fsSL "{{.Release.DownloadURL}}" -o /tmp/runner.tgz
+  - echo "{{.Release.SHA256}}  /tmp/runner.tgz" | sha256sum --check -
   - tar -xzf /tmp/runner.tgz -C /opt/runner
   - chown -R runner:runner /opt/runner
   - rm -f /tmp/runner.tgz

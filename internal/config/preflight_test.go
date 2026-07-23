@@ -134,9 +134,13 @@ func minimalCfg(t *testing.T) *Config {
 	c := &Config{}
 	c.GitHub.ConfigURL = "https://github.com/example"
 	c.GitHub.Auth.Mode = AuthModePAT
-	c.ScaleSet.Name = "x"
-	c.ScaleSet.MaxRunners = 1
-	c.Runner.RunnerVersion = "0.0.0"
+	c.ScaleSets.Classes = []RunnerClassConfig{{
+		VCPUs:      1,
+		MemoryGiB:  1,
+		DiskGiB:    10,
+		Arch:       ArchAMD64,
+		MaxRunners: 1,
+	}}
 	c.applyDefaults()
 	return c
 }

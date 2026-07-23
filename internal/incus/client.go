@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"time"
 
 	upstream "github.com/lxc/incus/v6/client"
 	"github.com/lxc/incus/v6/shared/api"
@@ -45,6 +46,9 @@ type Config struct {
 	Project string
 	// UserAgent is reported on every request. Defaults to "incuse".
 	UserAgent string
+	// RequestTimeout bounds Incus REST calls whose upstream wrapper
+	// does not accept a context. Defaults to ten minutes.
+	RequestTimeout time.Duration
 	// HTTPClient is an optional override used in tests to point the
 	// upstream client at a httptest.Server. Production callers leave
 	// this nil.
@@ -62,9 +66,17 @@ type realClient struct {
 // The returned Client must be Close()d when the orchestrator shuts
 // down so the upstream event listener does not leak.
 func Connect(ctx context.Context, cfg Config) (Client, error) {
+	requestTimeout := cfg.RequestTimeout
+	if requestTimeout <= 0 {
+		requestTimeout = 10 * time.Minute
+	}
+	httpClient := cfg.HTTPClient
+	if httpClient == nil {
+		httpClient = &http.Client{Timeout: requestTimeout}
+	}
 	args := &upstream.ConnectionArgs{
 		UserAgent:          chooseUserAgent(cfg.UserAgent),
-		HTTPClient:         cfg.HTTPClient,
+		HTTPClient:         httpClient,
 		InsecureSkipVerify: cfg.InsecureSkipVerify,
 		// We do not use the websocket events stream — Wait() falls back
 		// to /operations/<id>/wait polling, which is sufficient for
@@ -170,11 +182,12 @@ func (c *realClient) Launch(ctx context.Context, req LaunchRequest) (*Instance, 
 		Source: source,
 		Start:  true,
 		InstancePut: api.InstancePut{
-			Description: req.Description,
-			Config:      cloneStringMap(req.Config),
-			Devices:     cloneDevices(req.Devices),
-			Profiles:    append([]string(nil), req.Profiles...),
-			Ephemeral:   req.Ephemeral,
+			Architecture: reqArchitecture(req.Architecture),
+			Description:  req.Description,
+			Config:       cloneStringMap(req.Config),
+			Devices:      cloneDevices(req.Devices),
+			Profiles:     append([]string(nil), req.Profiles...),
+			Ephemeral:    req.Ephemeral,
 		},
 	}
 
@@ -272,12 +285,21 @@ func validateLaunch(req LaunchRequest) error {
 	switch {
 	case req.Name == "":
 		return errors.New("incus: LaunchRequest.Name is required")
+	case req.Architecture != "amd64" && req.Architecture != "arm64":
+		return errors.New("incus: LaunchRequest.Architecture must be amd64 or arm64")
 	case req.Type == "":
 		return errors.New("incus: LaunchRequest.Type is required")
 	case req.Image.Alias == "" && req.Image.Server == "":
 		return errors.New("incus: LaunchRequest.Image is required")
 	}
 	return nil
+}
+
+func reqArchitecture(arch string) string {
+	if arch == "arm64" {
+		return "aarch64"
+	}
+	return "x86_64"
 }
 
 func toInstance(in *api.Instance) *Instance {

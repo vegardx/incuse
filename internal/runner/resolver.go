@@ -6,6 +6,7 @@ package runner
 
 import (
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -22,23 +23,30 @@ type Release struct {
 	// path inside the VM.
 	Version string
 
-	// DownloadURL is the linux-x64 tarball URL — the value from the
-	// GitHub release asset's browser_download_url field.
+	// DownloadURL is the selected Linux tarball URL — the value from
+	// the GitHub release asset's browser_download_url field.
 	DownloadURL string
+
+	// SHA256 is the digest GitHub publishes for the selected asset.
+	// cloud-init verifies this before extracting the archive.
+	SHA256 string
 }
 
 // LatestResolver resolves the latest actions/runner release for the
-// architecture incuse hands out (amd64 / linux-x64 in the MVP). It
-// caches the result and refreshes on a ticker so a 100-runner burst
-// hits api.github.com once, not 100 times.
+// architecture incuse hands out. It caches the result so a burst of
+// runner spawns hits api.github.com once, not once per runner.
 type LatestResolver struct {
 	httpClient *http.Client
 	endpoint   string
 	ttl        time.Duration
 
-	mu       sync.RWMutex
-	cached   *Release
-	cachedAt time.Time
+	mu     sync.Mutex
+	cached map[string]cachedRelease
+}
+
+type cachedRelease struct {
+	release Release
+	at      time.Time
 }
 
 // NewLatestResolver returns a resolver pointing at the public GitHub
@@ -50,6 +58,7 @@ func NewLatestResolver(ttl time.Duration) *LatestResolver {
 		httpClient: &http.Client{Timeout: 30 * time.Second},
 		endpoint:   "https://api.github.com/repos/actions/runner/releases/latest",
 		ttl:        ttl,
+		cached:     make(map[string]cachedRelease),
 	}
 }
 
@@ -57,43 +66,32 @@ func NewLatestResolver(ttl time.Duration) *LatestResolver {
 // cache is empty or expired. Concurrent callers serialise on the
 // network fetch — the second-arrival fast-path returns the cached
 // value once the first arrival populates it.
-func (r *LatestResolver) Resolve(ctx context.Context) (Release, error) {
-	if cached, ok := r.fromCache(); ok {
-		return cached, nil
-	}
-
+func (r *LatestResolver) Resolve(ctx context.Context, arch string) (Release, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	// Re-check inside the lock: another goroutine may have populated
-	// while we were waiting on Lock().
-	if r.cached != nil && (r.ttl == 0 || time.Since(r.cachedAt) < r.ttl) {
-		return *r.cached, nil
+
+	if cached, ok := r.cached[arch]; ok &&
+		r.ttl > 0 && time.Since(cached.at) < r.ttl {
+		return cached.release, nil
 	}
 
-	rel, err := r.fetch(ctx)
+	rel, err := r.fetch(ctx, arch)
 	if err != nil {
+		if cached, ok := r.cached[arch]; ok && r.ttl > 0 {
+			return cached.release, nil
+		}
 		return Release{}, err
 	}
-	r.cached = &rel
-	r.cachedAt = time.Now()
+	if r.ttl > 0 {
+		r.cached[arch] = cachedRelease{release: rel, at: time.Now()}
+	}
 	return rel, nil
-}
-
-func (r *LatestResolver) fromCache() (Release, bool) {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	if r.cached == nil {
-		return Release{}, false
-	}
-	if r.ttl > 0 && time.Since(r.cachedAt) >= r.ttl {
-		return Release{}, false
-	}
-	return *r.cached, true
 }
 
 type githubReleaseAsset struct {
 	Name        string `json:"name"`
 	DownloadURL string `json:"browser_download_url"`
+	Digest      string `json:"digest"`
 }
 
 type githubReleaseResponse struct {
@@ -101,7 +99,7 @@ type githubReleaseResponse struct {
 	Assets  []githubReleaseAsset `json:"assets"`
 }
 
-func (r *LatestResolver) fetch(ctx context.Context) (Release, error) {
+func (r *LatestResolver) fetch(ctx context.Context, arch string) (Release, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, r.endpoint, nil)
 	if err != nil {
 		return Release{}, fmt.Errorf("building releases request: %w", err)
@@ -130,11 +128,40 @@ func (r *LatestResolver) fetch(ctx context.Context) (Release, error) {
 	}
 	version := strings.TrimPrefix(body.TagName, "v")
 
-	wantSuffix := fmt.Sprintf("linux-x64-%s.tar.gz", version)
+	runnerArch, err := releaseArch(arch)
+	if err != nil {
+		return Release{}, err
+	}
+	wantSuffix := fmt.Sprintf("linux-%s-%s.tar.gz", runnerArch, version)
 	for _, a := range body.Assets {
 		if strings.HasSuffix(a.Name, wantSuffix) && a.DownloadURL != "" {
-			return Release{Version: version, DownloadURL: a.DownloadURL}, nil
+			digest, ok := strings.CutPrefix(a.Digest, "sha256:")
+			if !ok || len(digest) != 64 {
+				return Release{}, fmt.Errorf(
+					"asset %s is missing a valid sha256 digest", a.Name)
+			}
+			if _, err := hex.DecodeString(digest); err != nil {
+				return Release{}, fmt.Errorf(
+					"asset %s has an invalid sha256 digest: %w", a.Name, err)
+			}
+			return Release{
+				Version:     version,
+				DownloadURL: a.DownloadURL,
+				SHA256:      digest,
+			}, nil
 		}
 	}
-	return Release{}, fmt.Errorf("no linux-x64 asset found for tag %s", body.TagName)
+	return Release{}, fmt.Errorf(
+		"no linux-%s asset found for tag %s", runnerArch, body.TagName)
+}
+
+func releaseArch(arch string) (string, error) {
+	switch strings.ToLower(arch) {
+	case "amd64":
+		return "x64", nil
+	case "arm64":
+		return "arm64", nil
+	default:
+		return "", fmt.Errorf("unsupported runner architecture %q", arch)
+	}
 }

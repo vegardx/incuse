@@ -2,7 +2,11 @@ package orchestrator
 
 import (
 	"context"
+	"strconv"
+	"sync"
 	"time"
+
+	"github.com/netwerk-io/incuse/internal/incus"
 )
 
 // reapOnce is one sweep. Three responsibilities:
@@ -15,19 +19,18 @@ import (
 //     runner.max_job_duration. Defence-in-depth — JobCompleted
 //     normally tears it down before this fires.
 //
-//  3. Drift sweep: any incuse-managed instance the local tracker has
-//     no record of is an orphan from a previous orchestrator
-//     process. Recover by deleting it. Covers crash recovery on
-//     systemd restart.
+//  3. Drift sweep: any instance managed by this scale set that the
+//     local tracker has no record of is an orphan from a previous
+//     orchestrator process. Recover by deleting it. Covers crash
+//     recovery without touching another class's runners.
 func (o *Orchestrator) reapOnce(ctx context.Context) {
 	now := o.cfg.Now()
-	for _, r := range o.tracker.snapshot() {
-		select {
-		case <-ctx.Done():
-			return
-		default:
-		}
-		o.reapTracked(ctx, r, now)
+	tracked := o.tracker.snapshot()
+	o.parallelReap(ctx, len(tracked), func(i int) {
+		o.reapTracked(ctx, tracked[i], now)
+	})
+	if ctx.Err() != nil {
+		return
 	}
 	o.driftSweep(ctx)
 }
@@ -46,11 +49,11 @@ func (o *Orchestrator) reapTracked(ctx context.Context, r trackedRunner, now tim
 			o.removeRunnerByID(ctx, r.RunnerID, r.Name, "max job duration")
 		}
 	default: // statusLaunching, statusIdle
-		if now.Sub(r.LaunchedAt) > o.cfg.RunnerCfg.RegistrationTimeout {
+		if now.Sub(r.MintedAt) > o.cfg.RunnerCfg.RegistrationTimeout {
 			o.cfg.Logger.Warn("reaping runner that never picked up a job",
 				"runner_name", r.Name,
 				"state", r.State,
-				"age", now.Sub(r.LaunchedAt),
+				"age", now.Sub(r.MintedAt),
 			)
 			o.cfg.Metrics.Reap("registration_timeout")
 			o.terminateInstance(ctx, r.Name, "registration timeout")
@@ -68,14 +71,21 @@ func (o *Orchestrator) driftSweep(ctx context.Context) {
 		o.cfg.Logger.Warn("drift sweep list failed", "error", err)
 		return
 	}
+	scaleSetID := strconv.Itoa(o.cfg.ScaleSet.ScaleSetID())
 	known := o.tracker.names()
+	var orphans []incus.Instance
 	for _, inst := range remote {
-		if inst.Config[metaManaged] != "true" {
+		if inst.Config[metaManaged] != "true" ||
+			inst.Config[metaScaleSetID] != scaleSetID {
 			continue
 		}
 		if _, tracked := known[inst.Name]; tracked {
 			continue
 		}
+		orphans = append(orphans, inst)
+	}
+	o.parallelReap(ctx, len(orphans), func(i int) {
+		inst := orphans[i]
 		o.cfg.Logger.Warn("reaping orphan instance",
 			"runner_name", inst.Name,
 			"status", inst.Status,
@@ -87,5 +97,26 @@ func (o *Orchestrator) driftSweep(ctx context.Context) {
 		if err := o.cfg.IncusClient.Delete(ctx, inst.Name); err != nil {
 			o.cfg.Logger.Warn("orphan delete failed", "runner_name", inst.Name, "error", err)
 		}
+	})
+}
+
+func (o *Orchestrator) parallelReap(
+	ctx context.Context,
+	count int,
+	reap func(i int),
+) {
+	var wg sync.WaitGroup
+	for i := 0; i < count; i++ {
+		if !o.launchLimiter.acquire(ctx) {
+			wg.Wait()
+			return
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			defer o.launchLimiter.release()
+			reap(i)
+		}()
 	}
+	wg.Wait()
 }

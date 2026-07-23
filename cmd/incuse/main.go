@@ -52,11 +52,11 @@ func main() {
 		os.Exit(1)
 	}
 
+	if err := config.Preflight(cfg); err != nil {
+		logger.Error("preflight", "path", *configPath, "error", err)
+		os.Exit(1)
+	}
 	if *validate {
-		if err := config.Preflight(cfg); err != nil {
-			logger.Error("preflight", "path", *configPath, "error", err)
-			os.Exit(1)
-		}
 		logger.Info("config ok", "path", *configPath)
 		return
 	}
@@ -85,6 +85,7 @@ func run(ctx context.Context, logger *slog.Logger, cfg *config.Config) error {
 		InsecureSkipVerify: cfg.Incus.InsecureSkipVerify,
 		Project:            cfg.Incus.Project,
 		UserAgent:          fmt.Sprintf("incuse/%s", version),
+		RequestTimeout:     cfg.Incus.RequestTimeout,
 	})
 	if err != nil {
 		return fmt.Errorf("incus connect: %w", err)
@@ -105,69 +106,85 @@ func run(ctx context.Context, logger *slog.Logger, cfg *config.Config) error {
 		return fmt.Errorf("read github auth: %w", err)
 	}
 
-	ssOpts := scaleset.Options{
-		Spec:              cfg.ScaleSet,
-		VCPUTiers:         cfg.Runner.VCPUTiers,
-		ConfigureURL:      cfg.GitHub.ConfigURL,
-		PAT:               pat,
-		AppClientID:       cfg.GitHub.Auth.App.ClientID,
-		AppPrivateKeyPEM:  appKey,
-		AppInstallationID: cfg.GitHub.Auth.App.InstallationID,
-		Logger:            logger,
-		Version:           version,
+	type runtimeSet struct {
+		scaleSet     *scaleset.ScaleSet
+		orchestrator *orchestrator.Orchestrator
 	}
-	if rec != nil {
-		ssOpts.MetricsRecorder = rec
-	}
-	ss, err := scaleset.New(ssOpts)
-	if err != nil {
-		return fmt.Errorf("scaleset new: %w", err)
-	}
-	if err := ss.Bootstrap(ctx); err != nil {
-		return fmt.Errorf("scaleset bootstrap: %w", err)
-	}
-	if obsServer != nil {
-		obsServer.MarkHealthy()
-	}
+	sets := make([]runtimeSet, 0, len(cfg.ScaleSets.Classes))
 	defer func() {
 		// Use a fresh context for shutdown — the parent ctx is already
 		// cancelled by the time defers run.
 		closeCtx, closeCancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer closeCancel()
-		if err := ss.Close(closeCtx); err != nil {
-			logger.Warn("scaleset close failed", "error", err)
+		for _, set := range sets {
+			if err := set.scaleSet.Close(closeCtx); err != nil {
+				logger.Warn("scaleset close failed", "error", err)
+			}
 		}
 	}()
+	resolver := runner.NewLatestResolver(*cfg.Runner.ReleaseCacheTTL)
+	mintLimiter := orchestrator.NewLimiter(cfg.Runner.MaxParallelMints)
+	launchLimiter := orchestrator.NewLimiter(cfg.Runner.MaxParallelLaunches)
+	for _, spec := range cfg.ScaleSetSpecs() {
+		classLogger := logger.With("scale_set", spec.Name)
+		ssOpts := scaleset.Options{
+			Spec:              spec,
+			ConfigureURL:      cfg.GitHub.ConfigURL,
+			PAT:               pat,
+			AppClientID:       cfg.GitHub.Auth.App.ClientID,
+			AppPrivateKeyPEM:  appKey,
+			AppInstallationID: cfg.GitHub.Auth.App.InstallationID,
+			Logger:            classLogger,
+			Version:           version,
+		}
+		if rec != nil {
+			ssOpts.MetricsRecorder = rec.ForScaleSet(spec.Name)
+		}
+		ss, err := scaleset.New(ssOpts)
+		if err != nil {
+			return fmt.Errorf("scaleset %q new: %w", spec.Name, err)
+		}
+		if err := ss.Bootstrap(ctx); err != nil {
+			return fmt.Errorf("scaleset %q bootstrap: %w", spec.Name, err)
+		}
+		sets = append(sets, runtimeSet{scaleSet: ss})
 
-	resolver := runner.NewLatestResolver(time.Hour)
-
-	orchCfg := orchestrator.Config{
-		IncusClient:     incusClient,
-		ScaleSet:        ss,
-		ReleaseResolver: resolver,
-		IncusCfg:        cfg.Incus,
-		RunnerCfg:       cfg.Runner,
-		Logger:          logger,
+		orchCfg := orchestrator.Config{
+			IncusClient:     incusClient,
+			ScaleSet:        ss,
+			ReleaseResolver: resolver,
+			IncusCfg:        cfg.Incus,
+			RunnerCfg:       cfg.Runner,
+			MintLimiter:     mintLimiter,
+			LaunchLimiter:   launchLimiter,
+			Logger:          classLogger,
+		}
+		if rec != nil {
+			orchCfg.Metrics = rec.ForScaleSet(spec.Name)
+		}
+		orch, err := orchestrator.New(orchCfg)
+		if err != nil {
+			return fmt.Errorf("orchestrator %q new: %w", spec.Name, err)
+		}
+		sets[len(sets)-1].orchestrator = orch
 	}
-	if rec != nil {
-		orchCfg.Metrics = rec
-	}
-	orch, err := orchestrator.New(orchCfg)
-	if err != nil {
-		return fmt.Errorf("orchestrator new: %w", err)
+	if obsServer != nil {
+		obsServer.MarkHealthy()
 	}
 
 	g, gctx := errgroup.WithContext(ctx)
 	if obsServer != nil {
 		g.Go(func() error { return obsServer.Run(gctx) })
 	}
-	g.Go(func() error { return ss.Run(gctx, orch) })
-	g.Go(func() error {
-		if obsServer != nil {
-			obsServer.MarkReady()
-		}
-		return orch.Run(gctx)
-	})
+	for _, set := range sets {
+		g.Go(func() error {
+			return set.scaleSet.Run(gctx, set.orchestrator)
+		})
+		g.Go(func() error { return set.orchestrator.Run(gctx) })
+	}
+	if obsServer != nil {
+		obsServer.MarkReady()
+	}
 	return g.Wait()
 }
 

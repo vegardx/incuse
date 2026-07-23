@@ -103,9 +103,13 @@ sudo install -m 0600 -o incuse -g incuse <(cat private-key.pem) /etc/incuse/gith
 At minimum:
 
 - `github.config_url` — your org URL.
-- `scale_set.name` — a name unique within the org.
-- `scale_set.max_runners` — start small (e.g. `4`) and tune up.
-- `runner.runner_version` + `runner.runner_sha256` — bump in lock-step. See `docs/runner-image.md` for how to fetch the current values.
+- `scale_sets.prefix` and at least one `scale_sets.classes` entry.
+- Each class's `max_runners` — start small (e.g. `4`) and tune up.
+- `incus.storage_pool` — the pool used by every runner root disk.
+- `runner.release_cache_ttl` — defaults to `1h`. After expiry, incuse refreshes
+  GitHub's public latest-release metadata; if that request fails, it uses the
+  last good cached release. Explicit `0s` disables both caching and stale
+  fallback and performs a request for every spawn.
 
 Validate before starting:
 
@@ -114,6 +118,33 @@ sudo -u incuse /usr/local/bin/incuse --validate --config /etc/incuse/config.yaml
 ```
 
 The preflight checks the config schema, every referenced credential / cert exists, and that secret files are at most `0600`. The systemd unit re-runs the same check via `ExecStartPre=`.
+
+### Runner classes and scale sets
+
+incuse expands each `scale_sets.classes` entry into an independent GitHub
+scale set. For example:
+
+```yaml
+scale_sets:
+  prefix: incuse
+  classes:
+    - vcpus: 4
+      memory_gib: 8
+      disk_gib: 20
+      arch: amd64
+      max_runners: 6
+```
+
+creates `incuse-4vcpu-8gb-20gb-amd64`. GitHub routes a job to that exact class
+with `runs-on: incuse-4vcpu-8gb-20gb-amd64`; every runner in it has the
+declared limits. Changing shared labels updates the existing scale set in
+place. Adding a class creates another scale set on restart. Removing a class
+stops incuse from managing it but deliberately does not delete the GitHub
+scale set; delete the retired set in GitHub after its queue is empty.
+
+`amd64` selects GitHub's `linux-x64` runner asset and Incus architecture
+`x86_64`; `arm64` selects `linux-arm64` and `aarch64`. The target Incus host
+must be capable of running the selected architecture.
 
 ## 6. Start the service
 
@@ -128,7 +159,14 @@ Within ~10 s you should see lines like:
 {"msg":"orchestrator running","reap_interval":"30s","max_runners":4,"project":"incuse"}
 ```
 
-Then trigger a workflow on a repo in your org with `runs-on: [incuse-rocket]` (or whatever you set `scale_set.name` to) and watch:
+Then trigger a workflow using a generated class name:
+
+```yaml
+runs-on: incuse-4vcpu-8gb-20gb-amd64
+```
+
+The name is `<prefix>-<vcpus>vcpu-<memory_gib>gb-<disk_gib>gb-<arch>`.
+Each name maps to one scale set and one immutable VM shape. Then watch:
 
 ```sh
 journalctl -u incuse -f

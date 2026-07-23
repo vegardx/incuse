@@ -7,14 +7,14 @@ VMs.
 
 ## What
 
-A single-host orchestrator that long-polls a GitHub Actions Runner Scale Set,
-mints a JIT runner config for each assigned job, and launches a fresh Incus VM
-to run it. The VM powers itself off when the runner exits; an idle reaper
-cleans up stragglers.
+A single-host orchestrator that owns one GitHub Actions Runner Scale Set per
+configured CPU/memory/disk/architecture class. It maintains GitHub's desired
+number of ephemeral JIT runners by launching fresh Incus VMs. Each VM powers
+itself off when the runner exits; a reaper cleans up stragglers.
 
 ```mermaid
 graph LR
-    GH[GitHub Actions] -->|long-poll| O[incuse]
+    GH[GitHub Actions scale sets] -->|long-poll| O[incuse]
     O -->|mint JIT| GH
     O -->|launch VM with cloud-init| I[Incus]
     I --> V1[VM] & V2[VM]

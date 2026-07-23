@@ -264,8 +264,9 @@ func TestLaunch_BuildsExpectedRequest(t *testing.T) {
 
 	c := f.connect(t, "incuse")
 	got, err := c.Launch(t.Context(), LaunchRequest{
-		Name: "runner-foo",
-		Type: InstanceTypeVM,
+		Name:         "runner-foo",
+		Architecture: "amd64",
+		Type:         InstanceTypeVM,
 		Image: ImageSource{
 			Server:   "https://images.linuxcontainers.org",
 			Protocol: "simplestreams",
@@ -310,6 +311,9 @@ func TestLaunch_BuildsExpectedRequest(t *testing.T) {
 	if string(body.Type) != "virtual-machine" {
 		t.Fatalf("body.Type: want virtual-machine, got %q", body.Type)
 	}
+	if body.Architecture != "x86_64" {
+		t.Fatalf("body.Architecture: want x86_64, got %q", body.Architecture)
+	}
 	if !body.Start {
 		t.Fatalf("body.Start: want true so the daemon does create+start in one op")
 	}
@@ -339,9 +343,10 @@ func TestLaunch_ValidatesRequest(t *testing.T) {
 		name string
 		req  LaunchRequest
 	}{
-		{"missing name", LaunchRequest{Type: InstanceTypeVM, Image: ImageSource{Alias: "x"}}},
-		{"missing type", LaunchRequest{Name: "n", Image: ImageSource{Alias: "x"}}},
-		{"missing image", LaunchRequest{Name: "n", Type: InstanceTypeVM}},
+		{"missing name", LaunchRequest{Architecture: "amd64", Type: InstanceTypeVM, Image: ImageSource{Alias: "x"}}},
+		{"missing arch", LaunchRequest{Name: "n", Type: InstanceTypeVM, Image: ImageSource{Alias: "x"}}},
+		{"missing type", LaunchRequest{Name: "n", Architecture: "amd64", Image: ImageSource{Alias: "x"}}},
+		{"missing image", LaunchRequest{Name: "n", Architecture: "amd64", Type: InstanceTypeVM}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

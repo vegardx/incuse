@@ -17,7 +17,9 @@ journalctl -u incuse -n 200 -o cat | jq -c .
 journalctl -u incuse -o cat | jq -c 'select(.runner_name == "incuse-rocket-aaaa")'
 ```
 
-Useful structured fields incuse always sets when relevant: `runner_name`, `runner_request_id`, `scale_set_id`, `vcpu`, `mem_mb`, `disk_gb`, `arch`, `error`, `reason`.
+Useful structured fields incuse sets when relevant: `runner_name`,
+`scale_set`, `scale_set_id`, `vcpu`, `mem_mb`, `disk_gb`, `arch`, `error`,
+and `reason`.
 
 ## Inspecting in-flight runners
 
@@ -86,7 +88,7 @@ In-flight runners (Incus VMs that have already started) are unaffected; the reap
 
 `systemctl stop incuse` cancels the orchestrator's context, which:
 
-- stops the listener (no new JobAssigned → no new launches),
+- stops every scale-set listener and cancels owned mint/launch tasks,
 - returns the reaper goroutine,
 - closes the scaleset session.
 

@@ -34,6 +34,9 @@ type LaunchRequest struct {
 	// Name is the Incus instance name. Must be unique within the
 	// target project.
 	Name string
+	// Architecture is the Go architecture name for the selected
+	// runner class: amd64 or arm64.
+	Architecture string
 	// Type is the instance type. MVP is always InstanceTypeVM.
 	Type InstanceType
 	// Profiles lists the Incus profiles to apply, in order. Empty falls

@@ -35,10 +35,6 @@ type Options struct {
 	// RunnerGroup, BaseLabels, MaxRunners.
 	Spec config.ScaleSetConfig
 
-	// VCPUTiers is the list of vcpu sizes incuse advertises on the
-	// scale set. Drives label generation in unionLabels.
-	VCPUTiers []int
-
 	// ConfigureURL is the GitHub config URL (org/repo/enterprise scope)
 	// passed to the scaleset library.
 	ConfigureURL string
@@ -88,8 +84,8 @@ func New(opts Options) (*ScaleSet, error) {
 	if opts.Spec.RunnerGroup == "" {
 		return nil, errors.New("scale_set.runner_group is required")
 	}
-	if len(opts.VCPUTiers) == 0 {
-		return nil, errors.New("vcpu_tiers must contain at least one tier")
+	if len(opts.Spec.BaseLabels) == 0 {
+		return nil, errors.New("scale_set.base_labels must contain the class label")
 	}
 	if opts.PAT == "" {
 		if opts.AppPrivateKeyPEM == "" {
@@ -125,7 +121,7 @@ func (s *ScaleSet) Bootstrap(ctx context.Context) error {
 		return fmt.Errorf("resolving runner group %q: %w", s.opts.Spec.RunnerGroup, err)
 	}
 
-	wantNames := config.ValidRunnerLabels(s.opts.Spec.BaseLabels, s.opts.VCPUTiers)
+	wantNames := s.opts.Spec.BaseLabels
 
 	existing, err := client.GetRunnerScaleSet(ctx, grp.ID, s.opts.Spec.Name)
 	if err != nil {
@@ -191,7 +187,7 @@ func (s *ScaleSet) buildClient(sysInfo ssapi.SystemInfo) (*ssapi.Client, error) 
 // GitHub-auth httptest dance.
 type scaleSetAPI interface {
 	CreateRunnerScaleSet(ctx context.Context, ss *ssapi.RunnerScaleSet) (*ssapi.RunnerScaleSet, error)
-	DeleteRunnerScaleSet(ctx context.Context, id int) error
+	UpdateRunnerScaleSet(ctx context.Context, id int, ss *ssapi.RunnerScaleSet) (*ssapi.RunnerScaleSet, error)
 }
 
 // sessionOpener is the slice of *ssapi.Client that openSessionWithRetry
@@ -209,11 +205,9 @@ var sessionRetryBackoff = func(attempt int) time.Duration {
 	return wait
 }
 
-// reconcileScaleSet creates the scale set when missing, recreates it
-// when labels drift, and otherwise returns the existing one. Recreate
-// (delete+create) is required because PATCH (UpdateRunnerScaleSet)
-// silently drops labels on at least one GHE version that kindling
-// hit — switching to delete+create is the upstream-known workaround.
+// reconcileScaleSet creates the scale set when missing, updates it
+// when labels drift, and otherwise returns the existing one. Updating
+// preserves the scale-set identity and queued work.
 func reconcileScaleSet(
 	ctx context.Context,
 	client scaleSetAPI,
@@ -241,23 +235,20 @@ func reconcileScaleSet(
 		return ss, nil
 
 	case !labelNamesMatch(existing.Labels, wantNames):
-		logger.Info("reconciling scale set labels (delete+recreate)",
+		logger.Info("reconciling scale set labels",
 			"scale_set_id", existing.ID,
 			"old_labels", labelNamesPlain(existing.Labels),
 			"new_labels", wantNames,
 		)
-		if err := client.DeleteRunnerScaleSet(ctx, existing.ID); err != nil {
-			return nil, fmt.Errorf("deleting stale scale set: %w", err)
-		}
-		ss, err := client.CreateRunnerScaleSet(ctx, &ssapi.RunnerScaleSet{
+		ss, err := client.UpdateRunnerScaleSet(ctx, existing.ID, &ssapi.RunnerScaleSet{
 			Name:          existing.Name,
 			RunnerGroupID: runnerGroupID,
 			Labels:        toLabels(wantNames),
 		})
 		if err != nil {
-			return nil, fmt.Errorf("recreating scale set with updated labels: %w", err)
+			return nil, fmt.Errorf("updating scale set labels: %w", err)
 		}
-		logger.Info("scale set recreated",
+		logger.Info("scale set updated",
 			"scale_set_id", ss.ID,
 			"persisted_labels", labelNames(ss.Labels),
 			"sent", wantNames,

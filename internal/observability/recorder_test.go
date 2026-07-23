@@ -19,10 +19,10 @@ func TestRecorder_RecordStatistics(t *testing.T) {
 		TotalBusyRunners:       2,
 		TotalIdleRunners:       5,
 	})
-	if got := testutil.ToFloat64(rec.statTotalAvailableJobs); got != 5 {
+	if got := testutil.ToFloat64(rec.statTotalAvailableJobs.WithLabelValues("")); got != 5 {
 		t.Errorf("available: want 5, got %v", got)
 	}
-	if got := testutil.ToFloat64(rec.statTotalRegisteredRunners); got != 7 {
+	if got := testutil.ToFloat64(rec.statTotalRegisteredRunners.WithLabelValues("")); got != 7 {
 		t.Errorf("registered: want 7, got %v", got)
 	}
 }
@@ -43,16 +43,16 @@ func TestRecorder_JobLifecycleCounters(t *testing.T) {
 	rec.RecordJobCompleted(nil)
 	rec.RecordDesiredRunners(8)
 
-	if got := testutil.ToFloat64(rec.runnersSpawned); got != 2 {
+	if got := testutil.ToFloat64(rec.runnersSpawned.WithLabelValues("")); got != 2 {
 		t.Errorf("jobs_assigned: want 2, got %v", got)
 	}
-	if got := testutil.ToFloat64(rec.jobsStarted); got != 1 {
+	if got := testutil.ToFloat64(rec.jobsStarted.WithLabelValues("")); got != 1 {
 		t.Errorf("jobs_started: want 1, got %v", got)
 	}
-	if got := testutil.ToFloat64(rec.jobsCompleted.WithLabelValues("seen")); got != 3 {
+	if got := testutil.ToFloat64(rec.jobsCompleted.WithLabelValues("", "unknown")); got != 3 {
 		t.Errorf("jobs_completed: want 3, got %v", got)
 	}
-	if got := testutil.ToFloat64(rec.desiredRunners); got != 8 {
+	if got := testutil.ToFloat64(rec.desiredRunners.WithLabelValues("")); got != 8 {
 		t.Errorf("desired_runners: want 8, got %v", got)
 	}
 }
@@ -64,10 +64,10 @@ func TestRecorder_LaunchCounters(t *testing.T) {
 	rec.LaunchFail()
 	rec.LaunchDuration(12.5)
 
-	if got := testutil.ToFloat64(rec.launches.WithLabelValues("ok")); got != 2 {
+	if got := testutil.ToFloat64(rec.launches.WithLabelValues("", "ok")); got != 2 {
 		t.Errorf("launches ok: %v", got)
 	}
-	if got := testutil.ToFloat64(rec.launches.WithLabelValues("fail")); got != 1 {
+	if got := testutil.ToFloat64(rec.launches.WithLabelValues("", "fail")); got != 1 {
 		t.Errorf("launches fail: %v", got)
 	}
 	// Histogram count is the only thing testutil exposes simply.
@@ -82,10 +82,10 @@ func TestRecorder_ReapBuckets(t *testing.T) {
 	rec.Reap("registration_timeout")
 	rec.Reap("drift_sweep")
 
-	if got := testutil.ToFloat64(rec.reaps.WithLabelValues("registration_timeout")); got != 2 {
+	if got := testutil.ToFloat64(rec.reaps.WithLabelValues("", "registration_timeout")); got != 2 {
 		t.Errorf("reg timeout reaps: %v", got)
 	}
-	if got := testutil.ToFloat64(rec.reaps.WithLabelValues("drift_sweep")); got != 1 {
+	if got := testutil.ToFloat64(rec.reaps.WithLabelValues("", "drift_sweep")); got != 1 {
 		t.Errorf("drift sweep reaps: %v", got)
 	}
 }
@@ -95,6 +95,18 @@ func TestRecorder_BuildInfoLabelled(t *testing.T) {
 	got := testutil.ToFloat64(rec.buildInfo.WithLabelValues("v1.2.3", "deadbee"))
 	if got != 1 {
 		t.Errorf("build_info: want 1, got %v", got)
+	}
+}
+
+func TestRecorder_ScaleSetAndCompletionResultLabels(t *testing.T) {
+	rec := New("", "")
+	class := rec.ForScaleSet("incuse-4vcpu-8gb-20gb-amd64")
+	class.RecordJobCompleted(&ssapi.JobCompleted{Result: "succeeded"})
+
+	got := testutil.ToFloat64(rec.jobsCompleted.WithLabelValues(
+		"incuse-4vcpu-8gb-20gb-amd64", "succeeded"))
+	if got != 1 {
+		t.Fatalf("completed counter: got %v, want 1", got)
 	}
 }
 
