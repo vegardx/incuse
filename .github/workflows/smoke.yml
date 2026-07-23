@@ -5,7 +5,7 @@ on:
 
 jobs:
   hello:
-    runs-on: [self-hosted, linux, x64, incuse-rocket]
+    runs-on: incuse-2vcpu-4gb-20gb-amd64
     steps:
       - name: Show host
         run: |

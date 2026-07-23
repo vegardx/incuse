@@ -14,7 +14,8 @@ journalctl -u incuse -f
 journalctl -u incuse -n 200 -o cat | jq -c .
 
 # Filter by runner name.
-journalctl -u incuse -o cat | jq -c 'select(.runner_name == "incuse-rocket-aaaa")'
+journalctl -u incuse -o cat |
+  jq -c 'select(.runner_name == "incuse-2vcpu-4gb-20gb-amd64-aaaa")'
 ```
 
 Useful structured fields incuse sets when relevant: `runner_name`,
