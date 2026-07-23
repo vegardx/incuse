@@ -232,7 +232,8 @@ func New(cfg Config) (*Orchestrator, error) {
 		cfg.LaunchLimiter = NewLimiter(cfg.RunnerCfg.MaxParallelLaunches)
 	}
 
-	lifecycleCtx, cancel := context.WithCancel(context.Background())
+	// Run owns cancel and invokes it before joining every lifecycle task.
+	lifecycleCtx, cancel := context.WithCancel(context.Background()) //nolint:gosec
 	return &Orchestrator{
 		cfg:           cfg,
 		tracker:       newInstanceTracker(),
